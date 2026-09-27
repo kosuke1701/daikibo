@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "daikibo-dev"
-version = "1.0.0.dev30"
+version = "1.0.0.dev31"
 description = "Evidence-bound local workflow control for large-scale agentic development"
 requires-python = ">=3.13,<3.14"
 license = "MIT"

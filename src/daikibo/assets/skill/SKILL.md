@@ -285,6 +285,16 @@ an old page as stale.
 
 ## Claim admission diagnostics
 
+Before assigning independent workers, call
+`task.parallel_candidates(project, limit=100, offset=0)`. Use
+`available_capacity`, each Task's `can_claim_now`, `unmet_dependencies`,
+`running_conflicts`, and `candidate_conflicts` to choose a non-conflicting
+batch. Candidate-to-candidate conflicts cover only the returned page; follow
+`next_offset` before treating the response as a complete inventory. This read
+does not reserve work. Claim every selected Task normally and accept a later
+rejection if dependencies, policy, capacity, or resources changed after the
+read.
+
 `task.claim(project, task=null)` keeps the existing claim ordering and gates.
 When no candidate is claimable it returns the existing `no_work` error with a
 list-shaped `details` value when the scheduler examined candidate-specific

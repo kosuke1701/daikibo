@@ -238,7 +238,7 @@ class Control:
           'change.propose':self.p.change,'change.attempt':self.p.attempt,'change.delta':self.p.set_delta,'change.apply':self.p.apply_technical_change,'change.withdraw':self.p.withdraw,
           'conflict.report':self.p.conflict,'decision.propose':self.p.propose_decision,'decision.respond':self.p.respond,'decision.apply':self.p.apply_decision,
           'decision.get':self.decision_get,'decision.recent':self.i.recent_decisions,
-          'task.create':self.w.create,'task.get':self.w.task,'task.list':self.task_list,'task.plan_tests':self.w.plan_tests,'task.ready':self.w.ready,
+          'task.create':self.w.create,'task.get':self.w.task,'task.list':self.task_list,'task.parallel_candidates':self.w.parallel_candidates,'task.plan_tests':self.w.plan_tests,'task.ready':self.w.ready,
           'task.claim':self.w.claim,'task.heartbeat':self.w.heartbeat,'task.complete':self.w.complete,'task.replan':self.w.replan,'task.cancel':self.w.cancel,
           'task.artifacts_collect':self.w.artifacts_collect,
           'workflow.status':self.w.status,'workflow.pause':self.w.pause,'workflow.reconcile':self.w.reconcile,
@@ -299,7 +299,7 @@ class Control:
           'assurance.withdraw_propose':self.assurance.withdraw_propose,
           'assurance.report':self.assurance.report,
         })
-        reads={'project.get','source.read','source.coverage','artifact.get','artifact.list','trace.impact','trace.audit','project.export','repository.list','program.next','decision.get','decision.recent','task.get','task.list','workflow.status','policy.get','adapter.list','run.get','evidence.get','context.fresh','code.search','code.consumers','code.read','code.inventory','delivery.get','delivery.profile_current','blob.read','api.describe',
+        reads={'project.get','source.read','source.coverage','artifact.get','artifact.list','trace.impact','trace.audit','project.export','repository.list','program.next','decision.get','decision.recent','task.get','task.list','task.parallel_candidates','workflow.status','policy.get','adapter.list','run.get','evidence.get','context.fresh','code.search','code.consumers','code.read','code.inventory','delivery.get','delivery.profile_current','blob.read','api.describe',
                'traceability.get','traceability.list','traceability.items','traceability.read','traceability.diff','traceability.review_subject','traceability.coverage','traceability.closure_subject','traceability.history','traceability.inspect_archive',
                'assurance.catalog','assurance.contains','assurance.object_get','assurance.object_list','assurance.refs','assurance.history','assurance.resolve','assurance.resolve_pinned','assurance.evaluate_current','assurance.review_subject','assurance.report'}
         reads.update({'task.test_evidence'})
@@ -505,6 +505,24 @@ class Control:
                                  'implementation_receipt'],
                     'artifact_status': 'draft',
                     'meaning_review': 'separate acceptance/review operation',
+                }
+            elif name == 'task.parallel_candidates':
+                descriptor['description'] = (
+                    'Read-only projection of ready/current Tasks, current claim blockers, remaining project capacity, '
+                    'conflicts with running Tasks, and pairwise conflicts within the returned page. It never claims '
+                    'work; task.claim rechecks authoritative current state before mutation.'
+                )
+                descriptor['body_contract'] = {
+                    'optional': ['limit', 'offset'],
+                    'result': ['project', 'project_paused', 'max_parallel', 'running_count',
+                               'available_capacity', 'tasks', 'candidate_conflicts_scope',
+                               'next_offset', 'claim_rechecks_current_state'],
+                    'task': ['task', 'title', 'revision', 'can_claim_now', 'blockers',
+                             'unmet_dependencies', 'running_conflicts', 'candidate_conflicts',
+                             'repos', 'write_paths', 'resource_reads', 'resource_writes'],
+                    'candidate_conflicts_scope': 'returned_page',
+                    'writes': False,
+                    'authoritative_mutation': 'task.claim',
                 }
             elif name == 'task.claim':
                 descriptor['description'] = (

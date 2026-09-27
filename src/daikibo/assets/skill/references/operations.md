@@ -378,6 +378,14 @@ attempt markers when an observed implementer run exists.
 
 ## Claim admission diagnostics
 
+`task.parallel_candidates(project, limit=100, offset=0)` is the read-only
+scheduling view for a coordinating Agent. It reports current project capacity,
+claimability blockers, unmet dependency IDs, conflicts with running Tasks, and
+pairwise conflicts among Tasks on the returned page. Follow `next_offset` for
+additional candidates; `candidate_conflicts` is deliberately page-scoped. The
+view neither claims nor reserves a Task, so every selected Task must still pass
+the normal `task.claim` transaction against current state.
+
 `task.claim(project, task=null)` preserves the existing admission, readiness,
 dependency, conflict, lease, and counter semantics. If no candidate can be
 claimed, its existing `no_work` fault may include a list-shaped `details`

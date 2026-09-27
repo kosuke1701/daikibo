@@ -1,4 +1,4 @@
-# 公開API — 1.0.0.dev30
+# 公開API — 1.0.0.dev31
 
 GENERATED — DO NOT EDIT。`tools/generate_api.py`で実コードから生成。
 
@@ -205,6 +205,7 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `task.heartbeat` | `(actor, task, epoch)` | false |
 | `task.history_record` | `(actor, history, expected_digest=None)` | true |
 | `task.list` | `(actor, project, limit=100, offset=0)` | true |
+| `task.parallel_candidates` | `(actor, project, limit=100, offset=0)` | true |
 | `task.plan_tests` | `(actor, task, body, review_receipt=None)` | false |
 | `task.progress` | `(actor, task)` | true |
 | `task.propose_plan_revision` | `(actor, task, expected_revision, expected_plan_digest, body, reason, evidence_refs)` | false |

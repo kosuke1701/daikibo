@@ -15,6 +15,18 @@ def overlaps(left, right):
             if not a or not b or a==b or a.startswith(b+'/') or b.startswith(a+'/'): return True
     return False
 
+
+def conflict_reasons(left, right):
+    """Return the stable resource dimensions that prevent two Tasks overlapping."""
+    reasons=[]
+    if set(left['repos']) & set(right['repos']) and overlaps(left['write_paths'],right['write_paths']):
+        reasons.append('write_path')
+    left_writes=set(left.get('resource_writes',[]));right_writes=set(right.get('resource_writes',[]))
+    left_reads=set(left.get('resource_reads',[]));right_reads=set(right.get('resource_reads',[]))
+    if left_writes & right_writes:reasons.append('resource_write_write')
+    if left_writes & right_reads or left_reads & right_writes:reasons.append('resource_read_write')
+    return reasons
+
 class Workflow:
     def __init__(self,store,security,knowledge,governance,execution_controls=None):
         self.s,self.sec,self.k,self.g=store,security,knowledge,governance
@@ -181,6 +193,119 @@ class Workflow:
             self.sec.event(self.task(actor,task)['project'],'task_ready',actor.id,{'task':task,'gate':gate['id']})
         return self.task(actor,task)
 
+    def _claim_candidate(self,actor,row,running,*,readonly=False):
+        """Apply the non-mutating portion of claim to one authoritative Task row."""
+        diagnostics=[]
+        if row['paused']:
+            diagnostics.append({'task':row['id'],'stage':'task_state','failures':['task_paused']})
+            return diagnostics,None
+        if row['status']!='ready':
+            diagnostics.append({'task':row['id'],'stage':'task_state','failures':['task_not_ready']})
+            return diagnostics,None
+        if self.execution_controls is not None:
+            admission = self.execution_controls.admission(actor,row['id'],readonly=readonly)
+        else:
+            # Preserve the existing standalone currentness check as the
+            # diagnostic source without adding a second gate.
+            current_failures=self.g.check_current(row['id'],ensure_policy=not readonly)
+            admission={'allowed': not bool(current_failures),'failures': current_failures}
+        if not admission['allowed']:
+            diagnostics.append({'task':row['id'],'stage':'execution_admission',
+                                'failures':admission.get('failures',[])})
+            return diagnostics,None
+        from .unit4_enforcement import (
+            inspect_task_admission,
+            task_admission_local_claim_binding,
+        )
+        admission_control = self.control or self.g
+        task_admission = inspect_task_admission(
+            admission_control, actor, task=row['id'], checkpoint='claim',
+        )
+        if task_admission.get('allowed') is not True:
+            diagnostics.append({
+                'task': row['id'], 'stage': 'task_admission',
+                'failures': [
+                    item.get('code') or item.get('reason') or item.get('kind') or 'blocked'
+                    for item in task_admission.get('failures', [])
+                    if isinstance(item, dict)
+                ] or ['task_admission_blocked'],
+            })
+            return diagnostics,None
+        local_claim_binding = task_admission_local_claim_binding(
+            task_admission, task=row['id'],
+        )
+        if getattr(self.g,'local_executions',None) is not None:
+            readonly_ready = getattr(self.g, '_evaluate_task_readonly', None)
+            readiness = (readonly_ready(actor, row['id'], 'ready')
+                         if callable(readonly_ready) else
+                         self.g.evaluate_task(actor, row['id'], 'ready'))
+            if readiness['verdict']!='pass':
+                readiness_failures=readiness.get('failures',[])
+                if any(value.startswith('dependency:') for value in readiness_failures):
+                    diagnostics.append({'task':row['id'],'stage':'dependency',
+                                        'failures':['dependency_not_current']})
+                    readiness_failures=[value for value in readiness_failures
+                                        if not value.startswith('dependency:')]
+                if readiness_failures:
+                    diagnostics.append({'task':row['id'],'stage':'ready_gate',
+                                        'failures':readiness_failures})
+                return diagnostics,None
+            if readiness.get('route')=='local':
+                local_auth=self.g.local_executions.current_authorization(actor,row['id'],'claim')
+                if not local_auth or not local_auth.get('allowed'):
+                    diagnostics.append({'task':row['id'],'stage':'local_authorization',
+                                        'failures':(local_auth or {}).get('failures',[])})
+                    return diagnostics,None
+        if self.s.one("SELECT d.task FROM task_deps d JOIN tasks t ON t.id=d.dependency WHERE d.task=? AND (t.status!='completed' OR t.validity!='current')",(row['id'],)):
+            diagnostics.append({'task':row['id'],'stage':'dependency',
+                                'failures':['dependency_not_current']})
+            return diagnostics,None
+        if any(conflict_reasons(row['body'],parse_json(other['body'])) for other in running):
+            diagnostics.append({'task':row['id'],'stage':'resource_conflict',
+                                'failures':['write_conflict']})
+            return diagnostics,None
+        return diagnostics,local_claim_binding
+
+    def parallel_candidates(self,actor,project,limit=100,offset=0):
+        """Describe ready Tasks that may run together without claiming them."""
+        project_row=self.k.project(actor,project)
+        need(type(limit) is int and 1<=limit<=500 and type(offset) is int and offset>=0,
+             'invalid_range','Invalid pagination')
+        policy=self.g.policy(project)['body'];now=timestamp()
+        running=self.s.all("SELECT id,body FROM tasks WHERE project=? AND status='running' AND lease_until>? ORDER BY created",(project,now))
+        rows=self.s.all("SELECT id FROM tasks WHERE project=? AND status='ready' AND validity='current' AND paused=0 ORDER BY created LIMIT ? OFFSET ?",(project,limit+1,offset))
+        selected=[self.task(actor,item['id']) for item in rows[:limit]]
+        capacity=max(0,policy['max_parallel']-len(running))
+        items=[]
+        for row in selected:
+            diagnostics,_=self._claim_candidate(actor,row,running,readonly=True)
+            unmet=[item['dependency'] for item in self.s.all(
+                "SELECT d.dependency FROM task_deps d JOIN tasks t ON t.id=d.dependency WHERE d.task=? AND (t.status!='completed' OR t.validity!='current') ORDER BY d.dependency",
+                (row['id'],))]
+            running_conflicts=[]
+            for other in running:
+                reasons=conflict_reasons(row['body'],parse_json(other['body']))
+                if reasons:running_conflicts.append({'task':other['id'],'reasons':reasons})
+            items.append({'task':row['id'],'title':row['body']['title'],'revision':row['revision'],
+                          'can_claim_now':not project_row['paused'] and capacity>0 and not diagnostics,
+                          'blockers':diagnostics,'unmet_dependencies':unmet,
+                          'running_conflicts':running_conflicts,'candidate_conflicts':[],
+                          'repos':row['body']['repos'],'write_paths':row['body']['write_paths'],
+                          'resource_reads':row['body'].get('resource_reads',[]),
+                          'resource_writes':row['body'].get('resource_writes',[])})
+        for index,left in enumerate(selected):
+            for other_index in range(index+1,len(selected)):
+                right=selected[other_index];reasons=conflict_reasons(left['body'],right['body'])
+                if reasons:
+                    items[index]['candidate_conflicts'].append({'task':right['id'],'reasons':reasons})
+                    items[other_index]['candidate_conflicts'].append({'task':left['id'],'reasons':reasons})
+        return {'project':project,'project_paused':bool(project_row['paused']),
+                'max_parallel':policy['max_parallel'],'running_count':len(running),
+                'available_capacity':capacity,'tasks':items,
+                'candidate_conflicts_scope':'returned_page',
+                'next_offset':offset+limit if len(rows)>limit else None,
+                'claim_rechecks_current_state':True}
+
     def claim(self,actor,project,task=None):
         actor.require('owner','agent','worker',project=project,task=task if actor.task else None)
         with self.s.transaction():
@@ -197,101 +322,9 @@ class Workflow:
             need(len(running)<policy['max_parallel'],'capacity','Parallelism limit reached')
             diagnostics=[]
             for row in candidates:
-                if row['paused']:
-                    diagnostics.append({'task':row['id'],'stage':'task_state','failures':['task_paused']})
-                    continue
-                if row['status']!='ready':
-                    diagnostics.append({'task':row['id'],'stage':'task_state','failures':['task_not_ready']})
-                    continue
-                if self.execution_controls is not None:
-                    admission = self.execution_controls.admission(actor,row['id'])
-                else:
-                    # Preserve the existing standalone currentness check as
-                    # the diagnostic source without adding a second gate.
-                    current_failures=self.g.check_current(row['id'])
-                    admission={'allowed': not bool(current_failures),
-                               'failures': current_failures}
-                if not admission['allowed']:
-                    diagnostics.append({'task':row['id'],'stage':'execution_admission',
-                                        'failures':admission.get('failures',[])})
-                    continue
-                # Unit4-R is the last readonly admission projection before
-                # this transaction mutates epoch, lease, local claim, and
-                # execution-control records.  A rejected candidate remains
-                # diagnostic only; no claim-side mutation is attempted.
-                from .unit4_enforcement import (
-                    inspect_task_admission,
-                    task_admission_local_claim_binding,
-                )
-                # The claim writer must consume the same readonly admission
-                # projection whether it is attached to the full Control or
-                # composed from the public Governance/Workflow services.  A
-                # missing Control is a composition shape, never evidence that
-                # the canonical Task population is empty.
-                admission_control = self.control or self.g
-                task_admission = inspect_task_admission(
-                    admission_control, actor, task=row['id'], checkpoint='claim',
-                )
-                if task_admission.get('allowed') is not True:
-                    diagnostics.append({
-                        'task': row['id'], 'stage': 'task_admission',
-                        'failures': [
-                            item.get('code') or item.get('reason') or
-                            item.get('kind') or 'blocked'
-                            for item in task_admission.get('failures', [])
-                            if isinstance(item, dict)
-                        ] or ['task_admission_blocked'],
-                    })
-                    continue
-                local_claim_binding = task_admission_local_claim_binding(
-                    task_admission, task=row['id'],
-                )
-                local_auth=None
-                if getattr(self.g,'local_executions',None) is not None:
-                    # Resolve the same readiness route used by ready.  A stale
-                    # local proposal must not shadow a Task that is already
-                    # eligible through the ordinary root path.  Claim already
-                    # has its own durable mutation below; this fallback is a
-                    # currentness read and must not create a second ready gate
-                    # or event while resolving local responsibility.
-                    readonly_ready = getattr(self.g, '_evaluate_task_readonly', None)
-                    readiness = (readonly_ready(actor, row['id'], 'ready')
-                                 if callable(readonly_ready) else
-                                 self.g.evaluate_task(actor, row['id'], 'ready'))
-                    if readiness['verdict']!='pass':
-                        readiness_failures=readiness.get('failures',[])
-                        if any(value.startswith('dependency:') for value in readiness_failures):
-                            # The readiness gate carries the dependency ID for
-                            # internal diagnostics.  Claim details expose only
-                            # the selected candidate and the stable cause.
-                            diagnostics.append({'task':row['id'],'stage':'dependency',
-                                                'failures':['dependency_not_current']})
-                            readiness_failures=[value for value in readiness_failures
-                                                if not value.startswith('dependency:')]
-                        if readiness_failures:
-                            diagnostics.append({'task':row['id'],'stage':'ready_gate',
-                                                'failures':readiness_failures})
-                        continue
-                    if readiness.get('route')=='local':
-                        local_auth=self.g.local_executions.current_authorization(actor,row['id'],'claim')
-                        if not local_auth or not local_auth.get('allowed'):
-                            diagnostics.append({'task':row['id'],'stage':'local_authorization',
-                                                'failures':(local_auth or {}).get('failures',[])})
-                            continue
-                if self.s.one("SELECT d.task FROM task_deps d JOIN tasks t ON t.id=d.dependency WHERE d.task=? AND (t.status!='completed' OR t.validity!='current')",(row['id'],)):
-                    diagnostics.append({'task':row['id'],'stage':'dependency',
-                                        'failures':['dependency_not_current']})
-                    continue
-                body=row['body']
-                conflict=False
-                for other in running:
-                    other_body=parse_json(other['body'])
-                    if set(body['repos'])&set(other_body['repos']) and overlaps(body['write_paths'],other_body['write_paths']): conflict=True
-                    if set(body.get('resource_writes',[])) & set(other_body.get('resource_writes',[])+other_body.get('resource_reads',[])): conflict=True
-                    if set(body.get('resource_reads',[])) & set(other_body.get('resource_writes',[])): conflict=True
-                if conflict:
-                    diagnostics.append({'task':row['id'],'stage':'resource_conflict',
-                                        'failures':['write_conflict']})
+                candidate_diagnostics,local_claim_binding=self._claim_candidate(actor,row,running)
+                if candidate_diagnostics:
+                    diagnostics.extend(candidate_diagnostics)
                     continue
                 expiry=timestamp()+policy['lease_seconds']
                 self.s.execute("UPDATE tasks SET status='running',epoch=epoch+1,lease_owner=?,lease_until=?,attempts=attempts+1,updated=? WHERE id=?",(actor.id,expiry,timestamp(),row['id']))

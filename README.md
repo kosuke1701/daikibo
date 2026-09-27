@@ -59,6 +59,13 @@ daikibo stop
 daikibo disconnect --workspace "$PWD"
 ```
 
+Before assigning multiple workers, a coordinating agent can inspect the
+currently claimable, non-conflicting Task candidates without reserving them:
+
+```bash
+daikibo call task.parallel_candidates --json '{"project":"PRJ-..."}'
+```
+
 Managed agent adapters use the existing login and environment of their CLI.
 Their execution modes may allow workspace changes without an interactive
 approval prompt, so run daikibo only in a workspace where that behavior is
