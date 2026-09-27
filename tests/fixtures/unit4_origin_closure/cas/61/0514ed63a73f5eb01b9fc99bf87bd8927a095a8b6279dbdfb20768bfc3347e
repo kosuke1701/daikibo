@@ -1,0 +1,1 @@
+{"verdict": "pass", "rationale": "Protocol fixture only; not semantic acceptance.", "covered": [], "findings": [], "observations": [{"ref": "FLOW-34a08dea43bbb7396e290dd5", "detail": "Fixture protocol observation only."}], "dispositions": []}

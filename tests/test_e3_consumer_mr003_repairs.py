@@ -1,0 +1,174 @@
+import copy,json,sys
+from pathlib import Path
+import pytest
+from daikibo.common import Fault,digest
+from daikibo.assurance_criteria import build_relation_request,evaluate_criteria,_set_denominator_alignment
+from daikibo.assurance_denominators import collect_stage_context,derive_denominator
+from daikibo.assurance_node_reviews import build_node_requests,select_node_reviews
+from daikibo.assurance_relations import REGISTRY_DIGEST
+from test_e3_consumer_mr import _artifact_ref,_requirements,_scope
+from test_e3_unit2a_denominators import _fixture
+
+@pytest.fixture
+def case(full,tmp_path):
+ f=_fixture(full,tmp_path)
+ from test_e3_unit2c_extractors import _valid_breakdown
+ f['breakdown']=_valid_breakdown(full,f,'BREAKDOWN-independent-full')
+ context=collect_stage_context(full,full.owner,project=f['project'],program=f['program'],stage='plan',proposed_breakdown=f['breakdown'])
+ den=derive_denominator(context)
+ scope=_scope(full,f['project'],f['parent'])
+ return f,context,den,scope
+
+def test_center_owner_population(full,case):
+ f,context,den,scope=case
+ request=build_relation_request(full,full.owner,context=context,denominator=den,relation='assigned_to',center_ref=_artifact_ref(f['project'],f['parent']),direction='outgoing',scope_ref=scope['scope_ref'],registry_digest=REGISTRY_DIGEST)
+ required=[o for o in den['obligations'] if o['id'] in request['required_obligation_ids']]
+ assert required
+ assert all(o['source_ref'].get('artifact')==f['parent']['id'] for o in required),required
+
+def test_set_alignment_cannot_ignore_stored_population(full,case):
+ f,context,den,scope=case
+ obs={x['id']:x for x in den['obligations']}
+ required=[x['id'] for x in den['obligations'] if x['category']=='acceptance_condition' and x['source_ref']['locator']['artifact']==f['parent']['id']]
+ empty=full.assurance.store_object(full.owner,f['project'],'obligations','independent-empty-obligations',1,{'format':'assurance.obligations.v1','project':f['project'],'obligations':[]})
+ aligned,reason=_set_denominator_alignment(full,f['project'],{'scope_ref':scope['scope_ref'],'expected_obligations_ref':full.assurance._object_ref(empty)},obs,required)
+ assert aligned is False,reason
+
+@pytest.mark.parametrize("unrelated_node",[False,True])
+def test_actual_runtime_relation_reviews(full,case,tmp_path,unrelated_node):
+ from daikibo.assurance_criteria import build_review_assurance
+ f,context,den,unused=case;p=f['project']
+ design=full.k.propose(full.owner,p,'design',{'title':'Design','statement':'Realize both requirements','source_refs':[f['source']['id']]})
+ design=full.k.accept(full.owner,design['id'],1)
+ roots=[_artifact_ref(p,x) for x in (f['parent'],design)]
+ scope=full.assurance.scope_propose(full.owner,p,{'roots':roots,'selection_rules':{},'exclusion_proposals':[],'authority_refs':[],'discovery_unknowns':[]})
+ profile=full.assurance.profile_propose(full.owner,p,None,{'scope_ref':scope['scope_ref'],'stage_rules':{'plan':{}},'relation_selectors':['depends_on'],'test_definition_bindings':[]})
+ script=tmp_path/'review.py'
+ script.write_text("import json,sys\np=json.load(sys.stdin);c=p.get('context',{})\nprint(json.dumps({'verdict':'pass','rationale':'actual subprocess fixture, not semantic LLM','covered':c.get('required_coverage',[]),'findings':[],'observations':[{'ref':p['subject'],'detail':'fixture read context'}],'dispositions':[]}))\n")
+ full.rt.adapters.register(full.owner,'mr-markers','fixture',sys.executable,[str(script)])
+ def review_adopt(root):
+  refs=[]
+  for packet,role in full.assurance._review_requirements(p,full.assurance._adoption_roots(p,root)):
+   ev=full.rt.review(full.owner,packet['id'],role,'mr-markers')
+   refs.append({'packet':packet['id'],'role':role,'id':ev['receipt']})
+  full.assurance.adopt(full.owner,p,root['id'],root['digest'],None,refs)
+ review_adopt(profile['profile'])
+ edges=[]
+ for req in (f['parent'],):
+  obs=[x['id'] for x in scope['obligations']['body']['obligations'] if x['source_ref'].get('artifact')==req['id']]
+  edge=full.assurance.edge_propose(full.owner,p,{'source_ref':_artifact_ref(p,design),'target_ref':_artifact_ref(p,req),'relation':'depends_on','scope_ref':profile['profile_ref'],'claim':'Actual design relation','obligation_ids':obs,'required_evidence_refs':[],'authority_refs':[]})
+  review_adopt(edge['edge']);edges.append(edge['edge'])
+ aset=full.assurance.set_propose(full.owner,p,{'center_ref':_artifact_ref(p,design),'relation':'depends_on','direction':'outgoing','scope_ref':profile['profile_ref'],'criteria':{},'required_evidence_refs':[]})
+ review_adopt(aset['set'])
+ request=build_relation_request(full,full.owner,context=context,denominator=den,relation='depends_on',center_ref=_artifact_ref(p,design),direction='outgoing',scope_ref=profile['profile_ref'],registry_digest=REGISTRY_DIGEST)
+ rr=build_review_assurance(full,full.owner,relation_request=request,set_ref=full.assurance._object_ref(aset['set']))
+ assert rr['status']=='satisfied',dict(rr)
+ assert rr['synthesis_review']['status']=='satisfied'
+ assert rr['independent_runs']['independent'] is True
+ if unrelated_node:
+  script.write_text(script.read_text().replace("c.get('required_coverage',[])","c.get('required_coverage',c.get('artifact',{}).get('body',{}).get('acceptance',[]))"))
+  full.rt.review(full.owner,f['child']['id'],'requirements','mr-markers')
+  nr=select_node_reviews(full,full.owner,node_requests=build_node_requests(full,full.owner,project=p,selectors=[{'selector':'requirement','node_ref':_artifact_ref(p,f['child'])}]))
+  assert nr[0]['roles']['requirements']['status']=='satisfied',list(nr)
+  evaluated=evaluate_criteria(relation='depends_on',requirements=_requirements('depends_on'),denominator=den,edges=edges,validated_reviews=nr,relation_request=request,relation_reviews=rr)
+  assert evaluated['criteria']['meaning_review']['status']!='satisfied',evaluated
+ # The actual result is retained for a second negative in this same real flow.
+ packet=next(x for x in full.assurance._root_packets(p,aset['set']) if x['body'].get('children'))
+ script.write_text(script.read_text().replace("'verdict':'pass'","'verdict':'fail'"))
+ full.rt.review(full.owner,packet['id'],packet['body']['required_roles'][0],'mr-markers')
+ newer=build_review_assurance(full,full.owner,relation_request=request,set_ref=full.assurance._object_ref(aset['set']))
+ assert newer['status']!='satisfied',dict(newer)
+
+def test_local_required_population_stays_local(full,case):
+ from daikibo.assurance_denominators import project_task
+ f,context,den,scope=case;p=f['project']
+ taskref={'kind':'task_revision','project':p,'task':f['task_a']['id'],'revision':f['task_a']['revision'],'definition_digest':digest(f['task_a']['body'])}
+ projection=project_task(den,taskref)
+ request=build_relation_request(full,full.owner,context=context,denominator=den,relation='assigned_to',center_ref=_artifact_ref(p,f['parent']),direction='outgoing',scope_ref=scope['scope_ref'],registry_digest=REGISTRY_DIGEST,projection=projection)
+ reviews=select_node_reviews(full,full.owner,node_requests=build_node_requests(full,full.owner,project=p,selectors=[]))
+ value=evaluate_criteria(relation='assigned_to',requirements=_requirements('assigned_to'),denominator=den,edges=[],validated_reviews=reviews,relation_request=request)
+ assert value['criteria']['all_requirements']['required_ids']==request['required_obligation_ids']
+
+def test_incoming_realizes_filters_exact_center(full,case):
+ f,context,den,unused=case;p=f['project']
+ scope=full.assurance.scope_propose(full.owner,p,{'roots':[_artifact_ref(p,f['parent']),_artifact_ref(p,f['child'])],'selection_rules':{},'exclusion_proposals':[],'authority_refs':[],'discovery_unknowns':[]})
+ req=build_relation_request(full,full.owner,context=context,denominator=den,relation='realizes',center_ref=_artifact_ref(p,f['parent']),direction='incoming',scope_ref=scope['scope_ref'],registry_digest=REGISTRY_DIGEST)
+ values=[o for o in den['obligations'] if o['id'] in req['required_obligation_ids']]
+ assert len(values)==len(f['parent']['body']['acceptance'])
+ assert all(o['source_ref']['locator']['artifact']==f['parent']['id'] for o in values)
+
+@pytest.mark.parametrize("projection_mode",["local_A","global_A_only","global_AB"])
+def test_local_a_does_not_require_global_b_contributor(full,case,projection_mode):
+ from daikibo.assurance_denominators import project_task
+ from test_e3_unit2a_denominators import _task
+ from test_e3_unit2c_extractors import _valid_breakdown
+ f,context,den,unused=case;p=f['project']
+ b=_task(full,p,f['parent']['id'],'Task B',[{'id':'b','argv':['python','-c','print(1)'],'purpose':'b'}])
+ body=json.loads(full.s.one('SELECT body FROM breakdowns WHERE id=?',(f['breakdown'],))['body'])
+ body['units'][0]['tasks'].append(b['id'])
+ bd=_valid_breakdown(full,f,'BREAKDOWN-independent-shared',body=body)
+ context=collect_stage_context(full,full.owner,project=p,program=f['program'],stage='plan',proposed_breakdown=bd)
+ den=derive_denominator(context)
+ taskref={'kind':'task_revision','project':p,'task':f['task_a']['id'],'revision':f['task_a']['revision'],'definition_digest':digest(f['task_a']['body'])}
+ scope=_scope(full,p,f['parent'])
+ request=build_relation_request(full,full.owner,context=context,denominator=den,relation='assigned_to',center_ref=_artifact_ref(p,f['parent']),direction='outgoing',scope_ref=scope['scope_ref'],registry_digest=REGISTRY_DIGEST,projection=project_task(den,taskref) if projection_mode=="local_A" else None)
+ obs=[o for o in den['obligations'] if o['id'] in request['required_obligation_ids']]
+ assert obs and len(obs[0]['contributors'])==2
+ ebody={'format':'assurance.edge.v1','project':p,'source_ref':_artifact_ref(p,f['parent']),'target_ref':taskref,'relation':'assigned_to','relation_contract_digest':REGISTRY_DIGEST,'scope_ref':scope['scope_ref'],'claim':'Task A owns its local contribution','obligation_ids':request['required_obligation_ids'],'required_evidence_refs':[],'authority_refs':[]}
+ edge=full.assurance.store_object(full.owner,p,'edge','independent-local-A',1,ebody)
+ nr=select_node_reviews(full,full.owner,node_requests=build_node_requests(full,full.owner,project=p,selectors=[]))
+ edges=[edge]
+ if projection_mode=='global_AB':
+  bref={'kind':'task_revision','project':p,'task':b['id'],'revision':b['revision'],'definition_digest':digest(b['body'])}
+  bodyb=copy.deepcopy(ebody);bodyb['target_ref']=bref
+  edges.append(full.assurance.store_object(full.owner,p,'edge','independent-global-B',1,bodyb))
+ result=evaluate_criteria(relation='assigned_to',requirements=_requirements('assigned_to'),denominator=den,edges=edges,validated_reviews=nr,relation_request=request)
+ assert result['criteria']['meaning_review']['status']!='satisfied'
+ if projection_mode=='global_A_only':
+  assert result['criteria']['all_requirements']['missing_ids']
+ else:
+  assert result['criteria']['all_requirements']['missing_ids']==[],result
+
+
+def test_center_owner_dispatch_table_is_closed():
+    from daikibo.assurance_criteria import _CENTER_OWNER_RULES
+    expected_relations = {
+        "extracted_from", "decomposes", "realizes", "implements", "verifies",
+        "exercises", "execution_of", "assigned_to", "produced_by", "migrated_to",
+        "depends_on", "affects", "contains",
+    }
+    assert set(_CENTER_OWNER_RULES) == expected_relations
+    assert all(set(value) == {"incoming", "outgoing"} for value in _CENTER_OWNER_RULES.values())
+
+
+def test_local_projection_owner_mapping_is_task_local(full, case):
+    from daikibo.assurance_denominators import project_task
+    from test_e3_unit2a_denominators import _task
+    from test_e3_unit2c_extractors import _valid_breakdown
+    f, context, den, unused = case
+    task_b = _task(full, f["project"], f["parent"]["id"], "Task B",
+                   [{"id": "b", "argv": ["python", "-c", "print(1)"], "purpose": "b"}])
+    body = json.loads(full.s.one("SELECT body FROM breakdowns WHERE id=?", (f["breakdown"],))["body"])
+    body["units"][0]["tasks"].append(task_b["id"])
+    breakdown = _valid_breakdown(full, f, "BREAKDOWN-independent-shared-owner", body=body)
+    context = collect_stage_context(full, full.owner, project=f["project"], program=f["program"],
+                                    stage="plan", proposed_breakdown=breakdown)
+    den = derive_denominator(context)
+    task_ref = {"kind": "task_revision", "project": f["project"], "task": f["task_a"]["id"],
+                "revision": f["task_a"]["revision"], "definition_digest": digest(f["task_a"]["body"])}
+    scope = _scope(full, f["project"], f["parent"])
+    local = build_relation_request(
+        full, full.owner, context=context, denominator=den, relation="assigned_to",
+        center_ref=_artifact_ref(f["project"], f["parent"]), direction="outgoing",
+        scope_ref=scope["scope_ref"], registry_digest=REGISTRY_DIGEST,
+        projection=project_task(den, task_ref),
+    )
+    global_request = build_relation_request(
+        full, full.owner, context=context, denominator=den, relation="assigned_to",
+        center_ref=_artifact_ref(f["project"], f["parent"]), direction="outgoing",
+        scope_ref=scope["scope_ref"], registry_digest=REGISTRY_DIGEST,
+    )
+    local_owners = {owner["task"] for item in local["owner_mapping"] for owner in item["owners"]}
+    global_owners = {owner["task"] for item in global_request["owner_mapping"] for owner in item["owners"]}
+    assert local_owners == {f["task_a"]["id"]}
+    assert global_owners == {f["task_a"]["id"], task_b["id"]}

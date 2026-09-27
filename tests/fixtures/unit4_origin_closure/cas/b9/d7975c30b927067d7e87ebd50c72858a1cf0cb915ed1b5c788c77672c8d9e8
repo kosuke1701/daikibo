@@ -1,0 +1,1 @@
+{"plan_body":{"checks":[{"argv":["python","-m","pytest","-q","test_calc.py"],"id":"unit","kind":"pytest","required_tests":["test_add"]}]},"plan_digest":"6f51ee33e2431428ab67ea2a42bebe27e6f2ef4742f540b98362e0586c0883b1","task":"TASK-0ab3961f86c73f9588512960","task_revision":1}

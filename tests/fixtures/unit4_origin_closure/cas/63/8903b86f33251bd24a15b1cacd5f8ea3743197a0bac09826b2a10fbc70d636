@@ -1,0 +1,1 @@
+{"argv":["python","-c","import calc; assert calc.add(2,3)==5"],"build_inputs":[],"build_outputs":[],"category":"start","id":"start","kind":"command","original_report":"results.xml","purpose":"Import and run","repo":"REPO-23a3970cb35eba188ed8c6bf"}

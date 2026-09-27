@@ -1,0 +1,4 @@
+from calc import add
+def test_add():
+    add(2,3)
+    assert True

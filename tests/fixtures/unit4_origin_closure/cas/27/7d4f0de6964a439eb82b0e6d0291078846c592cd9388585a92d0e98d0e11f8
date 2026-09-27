@@ -1,0 +1,1 @@
+{"argv":["python","-m","pytest","-q","test_calc.py"],"build_inputs":[],"build_outputs":[],"category":"smoke","id":"smoke","kind":"pytest","original_report":"results.xml","repo":"REPO-23a3970cb35eba188ed8c6bf","required_tests":["test_add"]}

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Example refund response shape; not full refund business semantics",
+  "type": "object",
+  "properties": {
+    "refund_id": {"type": "string", "minLength": 1},
+    "amount": {"type": "number", "minimum": 0.01, "multipleOf": 0.01},
+    "state": {"enum": ["pending", "completed"]}
+  },
+  "required": ["refund_id", "amount", "state"],
+  "additionalProperties": false
+}

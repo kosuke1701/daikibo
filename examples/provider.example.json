@@ -1,0 +1,8 @@
+{
+  "name": "anthropic-main",
+  "kind": "anthropic",
+  "base_url": "https://api.anthropic.com",
+  "secret": "REPLACE_LOCALLY_DO_NOT_COMMIT_REAL_KEY",
+  "models": [],
+  "max_requests": 256
+}

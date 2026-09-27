@@ -1,0 +1,1 @@
+The managed arithmetic function must return the exact integer sum of two integer inputs. AC-CLOSED requires add(2, 3) to return 5 and the corresponding repository test to pass.
