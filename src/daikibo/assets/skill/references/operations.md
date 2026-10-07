@@ -37,7 +37,8 @@ review-job.json:
 複数packetがあっても元sourceは一つの不変原文です。分類とレビューの完了条件は別です。
 
 裁定はnative.present_decision→ユーザー原文→native.respond→実consistency review→decision.apply。
-`native.acknowledge`には通知ID、後続source、正確な引用を渡します。product/conflictは汎用ackでは解消できません。
+`native.acknowledge`には通知ID、現通知版の発行後に記録したsource、正確な引用、取得した通知の`expected_digest`を渡します。通知が更新された場合、旧回答は再利用できません。product/conflictは汎用ackでは解消できません。
+通知の`created`は現通知版の表示時刻です。正確な新版と回答の前後関係は`notification_published`と`source_registered`の観測イベント順で照合します。同一通知内容の再送では版を変えません。
 
 CLI引数が変わった場合は実装のapi.describeを優先します。同じユーザー内の協調APIであり、別の認証・管理者承認端末は存在しません。
 
@@ -404,8 +405,10 @@ values are the canonical codes returned by that check. Existing local
 only that the current claim attempt observed a reason; it grants no claim,
 recovery, replan, counter, or execution authority.
 
-Automatic selection reports only the up-to-100 ready/current candidates the
-existing scheduler examined. It is bounded diagnostic evidence rather than a
+Automatic selection examines up to `scan_limit` candidates (default 1000).
+If unsearched candidates remain, `search_incomplete` includes `next_after_task`;
+continue with `after_task`. `no_work` means the remaining candidate range was
+exhausted. It is bounded diagnostic evidence rather than a
 complete project inventory. A successful claim returns the normal Task row
 and does not carry diagnostics from candidates that were skipped. Early
 errors and genuine admission exceptions retain their established error codes.
@@ -849,3 +852,45 @@ coverage is the exact `context.domain_review.required_coverage` list; generic
 acceptance strings are not substitutes. New-format portable history requires
 spec7/history2/archive13. Migration is explicit source-backed review and CAS,
 followed by new relation and node evidence; no current read performs migration.
+
+
+## Preparation and unchanged submissions
+
+Use `artifact.save` for draft synchronization: only an immediate save with the
+same body, reason, actor and expected current revision can preserve the revision.
+Use `artifact.revise` for an intentional revision; accepted artifacts still need
+the normal change workflow. An identical immediate `change.delta` re-save also
+preserves its binding and answers; `force_revision=true` requests a new revision.
+
+Call `task.preflight(task, adapter)` before acquiring a lease, or pass `adapter`
+to `task.claim`. This read-only check reports preparation and mandatory Context
+capacity failures without starting execution. It grants no execution authority.
+
+Ordinary `dialogue.input` and `native.input` reuse the current Program, including
+during delivery. Use `program.begin` or `start_program=true` for separate work;
+use the existing change/reopen workflow to modify existing work.
+
+Follow `job.list` and `code.consumers` pages using `next_offset` and the returned
+`snapshot` as `expected_snapshot`. Restart if the snapshot becomes stale.
+Consumer matches remain inferred evidence. Repeating a pause state preserves the
+execution epoch; use `fence=true` when deliberately fencing existing execution.
+
+## Exact review material for adoption
+
+Artifact/test-plan approvals, technical changes, provisional decisions and profile amendments require
+a review of their current complete material. Body-only receipts from older
+versions remain historical evidence; request a new review before adoption.
+An older PASS cannot override a newer valid FAIL/blocked for the same material
+and role, including Assurance and Traceability packet adoption.
+Test-plan freezing retains the full baseline snapshot manifest. A post-execution
+review of the same frozen plan reads that baseline only when current Task/read
+pins/dependencies/policy still match. Planned/ready Tasks use the current snapshot
+for proposal review, allowing agent review and re-freezing without owner intervention.
+Implementation reviews use the implementation snapshot.
+
+Agent asserted links require a `trace` or `design` review of the source with
+`proposal={"format":"artifact.link.v1","target":"TARGET_ID","relation":"realizes","confidence":"asserted","basis":"Exact relationship rationale"}`.
+After its review Job finishes, pass the observed receipt to `trace.link` with
+the same source, target, relation, confidence and basis. A general source
+Artifact review is insufficient; changing either endpoint or the proposal
+requires a review of the new material.

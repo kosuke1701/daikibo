@@ -11,7 +11,7 @@ import pytest
 from daikibo.assurance_node_reviews import build_node_requests, select_node_reviews
 from daikibo.assurance_criteria import evaluate_criteria
 from daikibo.assurance_denominators import collect_stage_context, derive_denominator, project_task
-from daikibo.common import Fault, canonical, digest, uid
+from daikibo.common import Actor, Fault, canonical, digest, uid
 
 
 def _artifact_ref(control, project, ident):
@@ -113,6 +113,103 @@ def test_task_plan_review_does_not_require_future_test_receipt(full, full_projec
     task, _, plan_body = _make_task(control, project, requirement)
     adapter = _review_adapter(control, tmp_path, "plan-review")
     control.rt.review(control.owner, task["id"], "test_plan", adapter, proposal=plan_body)
+    requests = build_node_requests(
+        control, control.owner, project=project,
+        selectors=[{"selector": "test_plan", "node_ref": _task_ref(control, project, task["id"])}],
+    )
+    selected = select_node_reviews(control, control.owner, node_requests=requests)
+    assert _role(selected)["status"] == "satisfied"
+
+
+def test_task_plan_supplemental_quality_uses_its_own_prompt_material(full, full_project, tmp_path):
+    control, project, _, requirement, _ = (full, *full_project)
+    task, _, plan_body = _make_task(control, project, requirement)
+    adapter = _review_adapter(control, tmp_path, "supplemental-task-review")
+    control.rt.review(control.owner, task["id"], "quality", adapter)
+    control.rt.review(control.owner, task["id"], "test_plan", adapter, proposal=plan_body)
+
+    requests = build_node_requests(
+        control, control.owner, project=project,
+        selectors=[{"selector": "test_plan", "node_ref": _task_ref(control, project, task["id"]),
+                    "roles": ["quality", "test_plan"]}],
+    )
+    selected = select_node_reviews(control, control.owner, node_requests=requests)
+    assert selected[0]["roles"]["quality"]["status"] == "satisfied"
+    assert selected[0]["roles"]["test_plan"]["status"] == "satisfied"
+
+
+def test_owner_frozen_plan_review_keeps_baseline_after_code_changes(full, full_project, tmp_path):
+    from conftest import make_task
+
+    control, project, _repository, _requirement, root = (full, *full_project)
+    task = make_task(control, full_project)
+    control.w.ready(control.owner, task)
+    row = control.w.task(control.owner, task)
+    plan_row = control.s.one("SELECT * FROM plans WHERE task=?", (task,), True)
+    plan_body = json.loads(plan_row["body"])
+    adapter = _review_adapter(control, tmp_path, "frozen-plan-baseline")
+    review = control.rt.review(control.owner, task, "test_plan", adapter, proposal=plan_body)
+    freeze = control.rt.review_materials.latest_plan_freeze(row, plan_row)
+    assert freeze["review_binding"] == control.g.receipt(review["receipt"])["binding"]
+    assert freeze["snapshot_digest"] == control.g.receipt(review["receipt"])["snapshot"]
+
+    # Runtime's current checkout now differs from the owner-frozen baseline.
+    source_file = root / "calc.py"
+    original_source = source_file.read_text()
+    source_file.write_text("def add(a, b):\n    return a + b + 1\n")
+    requests = build_node_requests(
+        control, control.owner, project=project,
+        selectors=[{"selector": "test_plan", "node_ref": _task_ref(control, project, task)}],
+    )
+    selected = select_node_reviews(control, control.owner, node_requests=requests)
+    assert _role(selected)["status"] == "satisfied"
+    source_file.write_text(original_source)
+
+    # The snapshot identity remains reusable only while semantic review
+    # material such as policy stays current.
+    policy = control.g.policy(project)
+    policy_body = dict(policy["body"])
+    policy_body["max_parallel"] += 1
+    with control.s.transaction():
+        control.s.execute("UPDATE policies SET revision=?,body=?,digest=? WHERE project=?",
+                          (policy["revision"] + 1, canonical(policy_body).decode(),
+                           digest(policy_body), project))
+    assert control.rt.review_materials.frozen_plan_snapshot(
+        control.owner, row, plan_row,
+    ) is None
+
+    agent = Actor("plan-adopting-agent", "agent", project)
+    with pytest.raises(Fault) as old_review:
+        control.w.plan_tests(agent, task, plan_body, review["receipt"])
+    assert old_review.value.code == "stale_evidence"
+    refreshed = control.rt.review(control.owner, task, "test_plan", adapter, proposal=plan_body)
+    control.w.plan_tests(agent, task, plan_body, refreshed["receipt"])
+    current_row = control.w.task(control.owner, task)
+    current_plan = control.s.one("SELECT * FROM plans WHERE task=?", (task,), True)
+    assert control.rt.review_materials.frozen_plan_snapshot(
+        control.owner, current_row, current_plan,
+    ) is not None
+    refreshed_requests = build_node_requests(
+        control, control.owner, project=project,
+        selectors=[{"selector": "test_plan", "node_ref": _task_ref(control, project, task)}],
+    )
+    refreshed_selected = select_node_reviews(
+        control, control.owner, node_requests=refreshed_requests,
+    )
+    assert _role(refreshed_selected)["status"] == "satisfied"
+
+
+def test_legacy_owner_frozen_plan_can_recover_current_review_baseline(full, full_project, tmp_path):
+    control, project, _, requirement, _ = (full, *full_project)
+    task, _, plan_body = _make_task(control, project, requirement)
+    adapter = _review_adapter(control, tmp_path, "legacy-plan-baseline")
+    control.rt.review(control.owner, task["id"], "test_plan", adapter, proposal=plan_body)
+    plan_row = control.s.one("SELECT * FROM plans WHERE task=?", (task["id"],), True)
+    # This signed event has the historical shape, before review binding and
+    # snapshot baseline were stored with a frozen plan.
+    control.sec.event(project, "test_plan_frozen", control.owner.id,
+                      {"task": task["id"], "digest": plan_row["digest"], "checks": ["unit"]})
+
     requests = build_node_requests(
         control, control.owner, project=project,
         selectors=[{"selector": "test_plan", "node_ref": _task_ref(control, project, task["id"])}],

@@ -21,7 +21,7 @@ managed roleでは必要な追加資料を既存の許可されたread APIで読
 1. 接続済みなら、このSkillの `references/connection.json` を読み、以後はその `command` 配列（Python実行パス・`--home`・`--socket`）でCLIを呼びます。別の既定homeへ接続し直しません。未接続なら `daikibo connect --client codex --workspace "$PWD" --name "プロジェクト名"` を実行します。Claude Codeは `--client claude`、両方は `--client both`。Codex用Skillは `.agents/skills/daikibo_dev` に配置されます。Codexは `skill-relay` で原文を記録し、Claude用Hookが動いているとは仮定しません。
 2. Hookの追加Contextにsession/project/sourceがあればそれを使います。なければconnectのsessionを使い、**今回のユーザー原文**を `native.input` で保存します。既にHookが同じ入力を保存したときは二重追加しません。原文を要約で置き換えません。
 3. 接続設定のworkspaceと現在の対象を確認し、`native.context` で現在の工程と未確認事項を取得します。サービス停止後は同じcommandで `start` を実行します。重要判断・矛盾・期限付き例外はユーザーに提示します。表示しただけでackしません。
-4. APIの引数を想像せず `daikibo call api.describe --json '{"method":"操作名"}'` で確認します。JSONは `--json @file.json` または `--json -` を使えます。`artifact.propose`／`artifact.revise` の説明には既存validatorに対応する `body_contract` が含まれ、supervisor promptには同じ情報が `contract_metadata` として含まれます。従来の `contracts` signature文字列は互換性のため維持されます。
+4. APIの引数を想像せず `daikibo call api.describe --json '{"method":"操作名"}'` で確認します。JSONは `--json @file.json` または `--json -` を使えます。`artifact.propose`／`artifact.revise`／`artifact.save` の説明には既存validatorに対応する `body_contract` が含まれ、supervisor promptには同じ情報が `contract_metadata` として含まれます。従来の `contracts` signature文字列は互換性のため維持されます。
 
 ## この会話で進める
 
@@ -305,8 +305,10 @@ canonical `failures` reported by that check. Typical stages are
 `forbidden`, `paused`, `capacity`, and an actual admission exception keep
 their existing behavior.
 
-Automatic selection explains only the up-to-100 ready/current candidates
-examined by the scheduler. It is a bounded diagnostic, not a complete Task
+Automatic selection examines up to `scan_limit` candidates (default 1000).
+If unsearched candidates remain, it returns `search_incomplete` with
+`next_after_task`; continue with `after_task`. `no_work` means the remaining
+candidate range was exhausted. It is a bounded diagnostic, not a complete Task
 inventory. Details contain only candidates authorized by the caller's project
 and Task scope. They describe checks already performed and never grant claim,
 recovery, replan, counter, or execution authority. A successful claim keeps

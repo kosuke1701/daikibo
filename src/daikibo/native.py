@@ -50,24 +50,28 @@ class Native:
                              {'session': session, 'client': client, 'cwd': str(path), 'authenticated_identity': False})
         return self.context(actor, session)
 
-    def input(self, actor, session, content, turn_id=None, origin='skill-relay'):
+    def input(self, actor, session, content, turn_id=None, origin='skill-relay', start_program=False):
         row = self._session(session); text(content, 'user input', 8_000_000)
+        need(type(start_program) is bool,'invalid_option','start_program must be Boolean')
         need(origin in {'skill-relay', 'claude-hook', 'interactive-terminal'}, 'invalid_origin', 'Unknown input origin')
         turn_id = turn_id or uid('TURN'); text(turn_id, 'turn ID', 500)
         with self.s.transaction():
             previous = self.s.one('SELECT * FROM native_turns WHERE session=? AND turn_id=?', (session, turn_id))
             if previous:
                 need(previous['digest'] == digest(content.encode()), 'idempotency_conflict', 'Turn ID reused with different text')
+                recorded=self.s.one("SELECT body FROM events WHERE kind='native_user_input_recorded' AND json_extract(body,'$.source')=? ORDER BY seq DESC LIMIT 1",(previous['source'],))
+                options=parse_json(recorded['body']) if recorded else {}
+                need(options.get('start_program',False)==start_program,'idempotency_conflict','Turn ID reused with a different program-start request')
                 return {'session': session, 'project': row['project'], 'source': previous['source'], 'replayed': True}
             human = Actor('reported-user:' + session, 'owner')
-            result = self.c.i.intake(human, content, project=row['project'], bounded=True)
+            result = self.c.i.intake(human, content, project=row['project'], bounded=True, start_program=start_program)
             source = result['source']['id']
             self.s.execute('INSERT INTO native_turns VALUES(?,?,?,?,?,?)',
                            (session, turn_id, source, digest(content.encode()), origin, timestamp()))
             row['body']['last_source'] = source; row['body']['last_turn'] = turn_id
             self._save(row)
             self.c.sec.event(row['project'], 'native_user_input_recorded', actor.id,
-                             {'session': session, 'source': source, 'origin': origin, 'identity_claim': 'reported-not-authenticated'})
+                             {'session': session, 'source': source, 'origin': origin, 'start_program':start_program,'identity_claim': 'reported-not-authenticated'})
         return {'session': session, 'project': row['project'], 'source': source, 'workflow': result['workflow'],
                 'notifications': result['mandatory_notifications']['items'], 'notification_catalog':result['mandatory_notifications'],
                 'notification_count':result['mandatory_notifications']['total'], 'notifications_are_index':True,'replayed': False}
@@ -115,11 +119,18 @@ class Native:
             if isinstance(value, list): return [resolve(v) for v in value]
             return value
         from .common import Fault, obj
+        from .action_batches import preflight
+        rejected = preflight(self.c, agent, actions, allowed)
+        if rejected:
+            self.c.sec.event(project,'native_proposals_rejected',agent.id,
+                             {'session':session,'source':source,'failure':rejected,'executed':0})
+            return {'actions': [rejected], 'all_applied': False, 'executed': 0}
         for action in actions:
             try:
                 obj(action, required=('method','params'), optional=('as',))
                 method = action['method']; need(method in allowed, 'workflow_boundary', 'Operation is not a proposal/configuration action')
                 params = resolve(action['params'])
+                need(isinstance(params,dict),'invalid_params','Resolved arguments must be a JSON object')
                 need(params.get('project', project) == project, 'cross_project', 'Session proposals cannot cross projects')
                 caller = Actor(agent.id, 'owner', project) if method in configuration else agent
                 result = self.c.invoke(caller, method, params)
@@ -146,7 +157,8 @@ class Native:
     def _quote(self, row, source, quote, after=0):
         text(quote, 'exact user quotation', 100000)
         turn = self.s.one('SELECT * FROM native_turns WHERE session=? AND source=?', (row['id'], source), True)
-        need(turn['created'] >= after, 'stale_user_input', 'The answer predates the proposal shown to the user')
+        if after is not None:
+            need(turn['created'] > after, 'stale_user_input', 'The answer predates the proposal shown to the user')
         original = self.s.one('SELECT blob FROM sources WHERE id=?', (source,), True)
         need(quote in self.s.blob_get(original['blob']).decode(), 'quote_mismatch', 'Quote must appear verbatim in the recorded user input')
         return turn
@@ -155,18 +167,28 @@ class Native:
         row = self._session(session); shown = row['body'].get('presented', {}).get(decision)
         need(shown and shown['digest']==expected_digest, 'proposal_not_presented', 'Present this exact proposal before recording its answer')
         with self.s.transaction():
+            decision_row=self.s.one('SELECT project FROM decisions WHERE id=?',(decision,),True)
+            need(decision_row['project']==row['project'],'cross_project','Decision belongs elsewhere')
             self._quote(row, source, quote, shown['at'])
-            result = self.c.p.respond(Actor('reported-user:' + session, 'owner'), decision, expected_digest, choice, quote)
+            result = self.c.p.respond(Actor('reported-user:' + session, 'owner'), decision, expected_digest, choice, quote, source=source)
             self.c.sec.event(row['project'], 'native_decision_response', actor.id,
                              {'session': session, 'decision': decision, 'input_source': source, 'quote': quote,
                               'proposal_digest': expected_digest, 'identity_authenticated': False})
         return result
 
-    def acknowledge(self, actor, session, item, source, quote):
-        row = self._session(session); notice = self.s.one('SELECT * FROM inbox WHERE id=?', (item,), True)
-        need(notice['project']==row['project'], 'cross_project', 'Notification belongs elsewhere')
-        self._quote(row, source, quote, notice['created'])
-        return self.c.i.acknowledge(Actor('reported-user:' + session, 'owner'), item, quote)
+    def acknowledge(self, actor, session, item, source, quote, expected_digest=None):
+        with self.s.transaction():
+            row = self._session(session); notice = self.s.one('SELECT * FROM inbox WHERE id=?', (item,), True)
+            need(notice['project']==row['project'], 'cross_project', 'Notification belongs elsewhere')
+            current_digest=digest(notice['body'].encode())
+            need(expected_digest is None or expected_digest==current_digest,
+                 'stale_notice','Notification content changed')
+            # The shared inbox layer checks durable publication/source event
+            # order. Keep this session check limited to membership and quote
+            # fidelity so equal timestamps and clock rollback stay valid.
+            self._quote(row, source, quote, after=None)
+            return self.c.i.acknowledge(Actor('reported-user:' + session, 'owner'), item, quote,
+                                        source=source,expected_digest=current_digest)
 
     def completion(self, actor, session, subject):
         row = self._session(session); task = self.s.one('SELECT * FROM tasks WHERE id=?', (subject,))
@@ -197,12 +219,16 @@ class Native:
         if task:
             blockers = self.c.g.evaluate_task(actor,subject,gate='recheck')['failures']
         else:
+            blocker_details = []
             blockers = [] if delivery['status'] in {'verified','delivered'} else ['delivery_not_certified']
             if not blockers:
                 from .common import Fault
                 try: self.c.d.certify(actor,subject,check_only=True)
-                except Fault as exc: blockers.append('delivery_recheck:'+exc.code)
+                except Fault as exc:
+                    blockers.append('delivery_recheck:'+exc.code)
+                    blocker_details.append({'subject': subject, 'binding': delivery['digest'], **exc.as_dict()})
         result = {'subject': subject, 'completed': not blockers, 'state': item['status'], 'blockers': blockers}
+        if delivery: result['blocker_details'] = blocker_details
         with self.s.transaction():
             row['body']['completion_request'] = result; self._save(row)
         return result

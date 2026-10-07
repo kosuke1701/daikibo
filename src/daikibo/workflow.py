@@ -152,6 +152,8 @@ class Workflow:
         row=self.task(actor,task)
         actor.require('owner','agent',project=row['project'])
         body,ids=self.validate_test_plan(actor,task,body,current=row)
+        plan_review_material=None
+        materials=getattr(self.g,'review_materials',None)
         with self.s.transaction():
             # The first read above validates the caller's shape.  Re-read the
             # authoritative Task inside the writer transaction so a concurrent
@@ -164,7 +166,11 @@ class Workflow:
             body,ids=self.validate_test_plan(actor,task,body,current=current)
             if actor.role!='owner':
                 need(review_receipt,'review_required','Independent test plan approval required')
-                self.g.require_review(review_receipt,task,digest(body),{'test_plan'})
+                need(materials is not None and callable(getattr(materials,'test_plan',None)),
+                     'review_material_unavailable','Current test-plan review material is unavailable')
+                plan_review_material=materials.test_plan(actor,current,body)
+                self.g.require_review(review_receipt,task,plan_review_material['binding'],
+                                      {'test_plan'},latest=True)
             self.s.execute("INSERT INTO plans VALUES(?,?,?,?,?) ON CONFLICT(task) DO UPDATE SET body=excluded.body,digest=excluded.digest,approved=excluded.approved,created=excluded.created",
                            (task,canonical(body).decode(),digest(body),actor.id if actor.role=='owner' else review_receipt,timestamp()))
             # Pin the saved Task revision and saved plan body through the
@@ -182,7 +188,23 @@ class Workflow:
                 actor, saved_task['project'], saved_task, saved_plan,
                 captured_from={'controller':'runtime','operation':'task.plan_tests'},
             )
-            self.sec.event(saved_task['project'],'test_plan_frozen',actor.id,{'task':task,'digest':saved_plan['digest'],'checks':sorted(ids)})
+            if plan_review_material is None:
+                need(materials is not None and callable(getattr(materials,'test_plan',None)),
+                     'review_material_unavailable','Current test-plan review material is unavailable')
+                plan_review_material=materials.test_plan(actor,saved_task,body)
+            snapshot=plan_review_material['snapshot']
+            # Keep the complete reviewed baseline manifest reachable from the
+            # signed freeze event. Its file bodies are already immutable CAS
+            # leaves; this manifest blob preserves their exact paths,
+            # repository membership and modes so a later independent review
+            # can materialize the same baseline after implementation changes.
+            snapshot_manifest_blob=self.s.blob_put(canonical(snapshot))
+            self.sec.event(saved_task['project'],'test_plan_frozen',actor.id,{
+                'task':task,'digest':saved_plan['digest'],'checks':sorted(ids),
+                'approved':saved_plan['approved'],'snapshot_digest':snapshot['digest'],
+                'snapshot_format':snapshot['format'],'snapshot_manifest_blob':snapshot_manifest_blob,
+                'review_binding':plan_review_material['binding'],
+            })
         return {'task':task,'digest':digest(body)}
 
     def ready(self,actor,task):
@@ -306,8 +328,11 @@ class Workflow:
                 'next_offset':offset+limit if len(rows)>limit else None,
                 'claim_rechecks_current_state':True}
 
-    def claim(self,actor,project,task=None):
+    def claim(self,actor,project,task=None,after_task=None,scan_limit=1000,adapter=None):
         actor.require('owner','agent','worker',project=project,task=task if actor.task else None)
+        need(type(scan_limit) is int and 1<=scan_limit<=10000,'invalid_range','Claim scan budget must be 1..10000')
+        need(not task or after_task is None,'invalid_params','Explicit task and scan continuation cannot be combined')
+        truncated=False
         with self.s.transaction():
             project_row=self.k.project(actor,project)
             need(not project_row['paused'],'paused','Project is paused')
@@ -316,7 +341,14 @@ class Workflow:
                 need(candidates[0]['project']==project,'cross_project','Task belongs elsewhere')
             else:
                 need(actor.task is None,'forbidden','Task capability must name its own task')
-                candidates=[self.task(actor,r['id']) for r in self.s.all("SELECT id FROM tasks WHERE project=? AND status='ready' AND validity='current' AND paused=0 ORDER BY created LIMIT 100",(project,))]
+                cursor_created=-1;cursor_id=''
+                if after_task is not None:
+                    prior=self.task(actor,after_task)
+                    need(prior['project']==project,'cross_project','Scan cursor belongs elsewhere')
+                    cursor_created,cursor_id=prior['created'],prior['id']
+                found=self.s.all("SELECT id FROM tasks WHERE project=? AND status='ready' AND validity='current' AND paused=0 AND (created>? OR (created=? AND id>?)) ORDER BY created,id LIMIT ?",(project,cursor_created,cursor_created,cursor_id,scan_limit+1))
+                truncated=len(found)>scan_limit
+                candidates=[self.task(actor,r['id']) for r in found[:scan_limit]]
             policy=self.g.policy(project)['body']
             running=self.s.all("SELECT id,body FROM tasks WHERE project=? AND status='running' AND lease_until>?",(project,timestamp()))
             need(len(running)<policy['max_parallel'],'capacity','Parallelism limit reached')
@@ -326,6 +358,12 @@ class Workflow:
                 if candidate_diagnostics:
                     diagnostics.extend(candidate_diagnostics)
                     continue
+                if adapter is not None:
+                    need(callable(getattr(self,'preflight',None)),'preflight_unavailable','Preparation diagnostics are not connected')
+                    preparation=self.preflight(actor,row['id'],adapter)
+                    if not preparation['ready']:
+                        diagnostics.append({'task':row['id'],'stage':'preparation','failures':preparation['failures']})
+                        continue
                 expiry=timestamp()+policy['lease_seconds']
                 self.s.execute("UPDATE tasks SET status='running',epoch=epoch+1,lease_owner=?,lease_until=?,attempts=attempts+1,updated=? WHERE id=?",(actor.id,expiry,timestamp(),row['id']))
                 if local_claim_binding is not None:
@@ -343,6 +381,9 @@ class Workflow:
                 self.sec.event(project,'task_claimed',actor.id,{'task':row['id'],'epoch':row['epoch']+1,
                     'attempt_ordinal':row['attempts']+1,'task_revision':row['revision'],'binding':binding,'expires':expiry})
                 return self.task(actor,row['id'])
+        if truncated:
+            raise Fault('search_incomplete','Claim scan budget exhausted; continue the scan',
+                        {'scanned':len(candidates),'next_after_task':candidates[-1]['id'],'diagnostics':diagnostics})
         # Preserve the historical list-shaped details value even when the
         # scheduler examined no candidates at all.
         raise Fault('no_work','No eligible task; blocked and conflicting tasks were not executed',
@@ -373,14 +414,19 @@ class Workflow:
             self.sec.event(row['project'],'task_completed',actor.id,{'task':task,'gate':gate['id'],'assurance':self.g.mode})
         return self.task(actor,task)
 
-    def pause(self,actor,project,task=None,paused=True):
+    def pause(self,actor,project,task=None,paused=True,fence=False):
         actor.require('owner','agent',project=project)
-        need(type(paused) is bool,'invalid_input','paused must be Boolean')
+        need(type(paused) is bool and type(fence) is bool,'invalid_input','paused and fence must be Boolean')
         with self.s.transaction():
             if task:
                 row=self.task(actor,task); need(row['project']==project,'cross_project','Wrong project')
+                if bool(row['paused']) == paused and not fence:
+                    return {'project':project,'task':task,'paused':paused,'unchanged':True}
                 self.s.execute("UPDATE tasks SET paused=?,epoch=epoch+1,lease_until=NULL,updated=? WHERE id=?",(int(paused),timestamp(),task))
             else:
+                row=self.k.project(actor,project)
+                if bool(row['paused']) == paused and not fence:
+                    return {'project':project,'task':None,'paused':paused,'unchanged':True}
                 self.s.execute("UPDATE projects SET paused=? WHERE id=?",(int(paused),project))
                 if paused:
                     self.s.execute("UPDATE tasks SET epoch=epoch+1,lease_until=NULL WHERE project=? AND status='running'",(project,))

@@ -15,7 +15,7 @@ import subprocess
 from copy import deepcopy
 from pathlib import Path
 
-from daikibo.common import parse_json
+from daikibo.common import digest, parse_json
 from daikibo.control import Control
 from daikibo.qualification import catalog
 
@@ -178,9 +178,51 @@ def artifact_proposal_review(packet, context):
         # semantic branch must never turn an invalid body into a subprocess
         # exception or an accidental PASS.
         body = {}
-    if binding != artifact_digest:
-        fail("The review binding is not the canonical artifact digest.",
-             "binding=%r artifact.digest=%r" % (binding, artifact_digest))
+    if role == "domain_responsibility":
+        # DOMAIN responsibility reviews have a dedicated accepted-DOMAIN
+        # contract whose binding remains the artifact body digest. Generic
+        # design/interface proposal reviews below use shared review material.
+        expected_binding = artifact_digest
+    else:
+        policy = context.get("review_policy")
+        review_snapshot = context.get("review_snapshot")
+        if (not isinstance(policy, dict) or set(policy) != {"revision", "digest", "body"} or
+                type(policy.get("revision")) is not int or policy["revision"] < 1 or
+                not isinstance(policy.get("body"), dict) or
+                policy.get("digest") != json_digest(policy.get("body"))):
+            block("The canonical review policy material is missing or malformed.", repr(policy))
+            expected_binding = None
+        elif (not isinstance(review_snapshot, dict) or
+              set(review_snapshot) != {"format", "digest"} or
+              review_snapshot.get("format") != "snapshot.v1" or
+              review_snapshot.get("digest") != json_digest({"repos": {}})):
+            block("The artifact review snapshot identity is missing or malformed.",
+                  repr(review_snapshot))
+            expected_binding = None
+        else:
+            material = {
+                "artifact": {key: artifact.get(key) for key in
+                             ("id", "project", "kind", "revision", "digest", "body")},
+                "sources": context.get("sources"),
+                "accepted_invariants": context.get("accepted_invariants"),
+                "policy": policy,
+            }
+            try:
+                expected_binding = json_digest({
+                    "format": "daikibo.review-material.v1",
+                    "kind": "artifact_proposal",
+                    "project": artifact_project,
+                    "subject": artifact_id,
+                    "snapshot_digest": review_snapshot["digest"],
+                    "material": material,
+                })
+            except (TypeError, ValueError):
+                block("The canonical artifact review input cannot be digested.",
+                      "The material contains a non-canonical JSON value.")
+                expected_binding = None
+    if expected_binding is None or binding != expected_binding:
+        fail("The review binding does not match the canonical artifact review input.",
+             "binding=%r expected=%r" % (binding, expected_binding))
     if artifact.get("status") != "accepted":
         fail("The artifact is not an accepted proposal.", "status=%r" % (artifact.get("status"),))
 
@@ -1096,15 +1138,35 @@ def _run_finite_review(executable: Path, packet: dict, cwd: Path) -> dict:
 
 def _artifact_packet(*, role: str, artifact: dict, source: dict,
                      invariants: list[dict] | None = None) -> dict:
+    policy_body = {"fixture": "finite artifact review policy"}
+    policy = {"revision": 1, "digest": digest(policy_body), "body": policy_body}
+    review_snapshot = {"format": "snapshot.v1", "digest": digest({"repos": {}})}
+    context = {
+        "review_policy": policy,
+        "review_snapshot": review_snapshot,
+        "sources": [source],
+        "accepted_invariants": invariants or [],
+    }
+    material = {
+        "artifact": {key: artifact[key] for key in
+                     ("id", "project", "kind", "revision", "digest", "body")},
+        "sources": context["sources"],
+        "accepted_invariants": context["accepted_invariants"],
+        "policy": policy,
+    }
+    binding = digest({
+        "format": "daikibo.review-material.v1",
+        "kind": "artifact_proposal",
+        "project": artifact["project"],
+        "subject": artifact["id"],
+        "snapshot_digest": review_snapshot["digest"],
+        "material": material,
+    })
     return {
         "role": role,
         "subject": artifact["id"],
-        "binding": artifact["digest"],
-        "context": {
-            "artifact": artifact,
-            "sources": [source],
-            "accepted_invariants": invariants or [],
-        },
+        "binding": binding,
+        "context": {"artifact": artifact, **context},
     }
 
 
@@ -1207,6 +1269,20 @@ def test_finite_artifact_branch_replays_positive_and_negative_material(tmp_path)
                                      source=source, invariants=[invariant])
     wrong_subject["subject"] = "DESIGN-foreign"
     controls.append(("wrong-subject", wrong_subject, {"blocked", "fail"}))
+
+    legacy_body_binding = _artifact_packet(role="design", artifact=design,
+                                           source=source, invariants=[invariant])
+    legacy_body_binding["binding"] = design["digest"]
+    controls.append(("legacy-artifact-digest-binding", legacy_body_binding,
+                     {"blocked", "fail"}))
+
+    changed_policy = _artifact_packet(role="design", artifact=design,
+                                      source=source, invariants=[invariant])
+    policy_body = changed_policy["context"]["review_policy"]["body"]
+    policy_body["fixture"] = "different policy input"
+    changed_policy["context"]["review_policy"]["digest"] = digest(policy_body)
+    controls.append(("changed-policy-with-old-binding", changed_policy,
+                     {"blocked", "fail"}))
 
     wrong_kind = _artifact_packet(role="consistency", artifact=design,
                                   source=source, invariants=[invariant])

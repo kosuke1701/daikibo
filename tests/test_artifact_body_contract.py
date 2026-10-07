@@ -53,6 +53,7 @@ def test_describe_body_contract_matches_validator_for_every_kind(full):
     methods = described["methods"]
     assert methods["artifact.propose"]["body_contract"] == contract
     assert methods["artifact.revise"]["body_contract"] == contract
+    assert methods["artifact.save"]["body_contract"] == contract
     assert "body_contract" not in methods["artifact.accept"]
     assert full.describe(full.owner, method="artifact.get")["methods"]["artifact.get"].get("body_contract") is None
     assert set(full.describe(full.owner, method="artifact.propose")["methods"]) == {"artifact.propose"}

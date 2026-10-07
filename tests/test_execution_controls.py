@@ -81,6 +81,40 @@ def test_policy_adoption_requires_source_backed_requirement_review(full, full_pr
     assert error.value.code == "review_required"
 
 
+def test_policy_requirement_review_retains_accepted_material_after_context_changes(full, full_project):
+    from test_execution_control_lifecycle import _reviewed_requirement
+
+    project = full_project[0]
+    source = full.s.one("SELECT id FROM sources WHERE project=? LIMIT 1", (project,), True)
+    requirement = _reviewed_requirement(full, project, source["id"])
+    row = full.s.one("SELECT * FROM artifacts WHERE id=?", (requirement["id"],), True)
+    receipt = full.execution_controls._requirement_review(row)
+    assert full.g.receipt(receipt)["binding"] != row["digest"]
+    invariant = full.k.propose(full.owner, project, "design", {
+        "title": "New independent constraint", "statement": "Retain the reviewed policy source.",
+        "critical": True,
+    })
+    full.k.accept(full.owner, invariant["id"], 1)
+    # Historical acceptance remains proof of this exact requirement; the
+    # policy proposal has its own separate review of the current context.
+    assert full.execution_controls._requirement_review(row) == receipt
+
+
+def test_policy_requirement_review_rejects_other_artifact_in_acceptance_event(full, full_project):
+    project = full_project[0]
+    source = full.s.one("SELECT id FROM sources WHERE project=? LIMIT 1", (project,), True)
+    body = {"title": "Policy requirement", "statement": "Source-backed policy.",
+            "acceptance": ["AC-POLICY"], "source_refs": [source["id"]]}
+    reviewed = full.k.propose(full.owner, project, "requirement", body)
+    receipt = full.rt.review(full.owner, reviewed["id"], "requirements", "fixture")["receipt"]
+    other = full.k.propose(full.owner, project, "requirement", {**body, "title": "Other policy"})
+    full.k.accept(full.owner, other["id"], 1, receipt)
+    row = full.s.one("SELECT * FROM artifacts WHERE id=?", (other["id"],), True)
+    with pytest.raises(Fault) as error:
+        full.execution_controls._requirement_review(row)
+    assert error.value.code == "review_required"
+
+
 def test_inconclusive_is_nonfinal_and_markers_are_typed(full):
     body = {
         "target_attempt_epoch": 1,

@@ -25,6 +25,7 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `artifact.propose` | `(actor, project: 'str', kind: 'str', body: 'dict', owner: 'str' = 'unassigned', artifact_id: 'str \| None' = None)` | false |
 | `artifact.read` | `(actor, artifact, expected_digest, offset=0, byte_budget=12000, revision=None)` | true |
 | `artifact.revise` | `(actor, artifact: 'str', expected_revision: 'int', body: 'dict', reason: 'str')` | false |
+| `artifact.save` | `(actor, artifact: 'str', expected_revision: 'int', body: 'dict', reason: 'str')` | false |
 | `assurance.adopt` | `(actor, project: 'str', subject: 'str', expected_digest: 'str', expected_head: 'str \| None', review_refs: 'list[dict[str, Any]]') -> 'dict[str, Any]'` | false |
 | `assurance.catalog` | `(actor, contract_digest: 'str \| None' = None) -> 'dict[str, Any]'` | true |
 | `assurance.contains` | `(actor, project: 'str', container: 'dict[str, Any]', member: 'dict[str, Any]') -> 'dict[str, Any]'` | true |
@@ -67,15 +68,15 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `breakdown.upload_status` | `(actor, upload, offset=0, limit=100)` | true |
 | `change.apply` | `(actor, change, review_receipt)` | false |
 | `change.attempt` | `(actor, change, level, body)` | false |
-| `change.delta` | `(actor, change, expected_revision, deltas, reason)` | false |
+| `change.delta` | `(actor, change, expected_revision, deltas, reason, force_revision=False)` | false |
 | `change.propose` | `(actor, project, body)` | false |
 | `change.withdraw` | `(actor, change, reason, compensation)` | false |
-| `code.consumers` | `(actor, project, symbol, limit=100)` | true |
+| `code.consumers` | `(actor, project, symbol, limit=100, offset=0, expected_snapshot=None)` | true |
 | `code.inventory` | `(actor, project)` | true |
 | `code.read` | `(actor, repo, path, start_line=1, line_count=100, expected_digest=None)` | true |
 | `code.search` | `(actor, project, query, limit=20)` | true |
 | `conflict.report` | `(actor, project, refs, explanation, options)` | false |
-| `context.build` | `(actor, task, byte_budget=200000, query=None)` | false |
+| `context.build` | `(actor, task, byte_budget=200000, query=None, persist=True)` | false |
 | `context.fresh` | `(actor, context)` | true |
 | `contract.check_instance` | `(actor, document, expected_digest, instance_document, instance_digest, entry='#', instance_entry='#', dialect=None)` | true |
 | `contract.check_schema` | `(actor, document, expected_digest, entry='#', dialect=None)` | true |
@@ -90,7 +91,7 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `decision.get` | `(actor, decision)` | true |
 | `decision.propose` | `(actor, project, body)` | false |
 | `decision.recent` | `(actor, project, since=0)` | true |
-| `decision.respond` | `(actor, decision, expected_digest, choice, utterance)` | false |
+| `decision.respond` | `(actor, decision, expected_digest, choice, utterance, source=None)` | false |
 | `delivery.certify` | `(actor, delivery, check_only=False)` | false |
 | `delivery.commit` | `(actor, delivery, message)` | false |
 | `delivery.configure` | `(actor, project, body, expected_digest=None, review_receipt=None)` | false |
@@ -98,7 +99,7 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `delivery.get` | `(actor, delivery)` | true |
 | `delivery.prepare` | `(actor, project)` | false |
 | `delivery.profile_current` | `(actor, project)` | true |
-| `dialogue.input` | `(actor, content, project=None, name='New project', bounded=False)` | false |
+| `dialogue.input` | `(actor, content, project=None, name='New project', bounded=False, start_program=False)` | false |
 | `document.attach_text` | `(actor, document, raw_digest, content, reason)` | false |
 | `document.get` | `(actor, document)` | true |
 | `document.import` | `(actor, project, content_base64, locator, media_type='application/octet-stream')` | false |
@@ -117,13 +118,13 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `execution_control.propose` | `(actor, task, expected_revision, body)` | false |
 | `execution_control.withdraw` | `(actor, proposal, expected_digest, reason)` | false |
 | `gate.evaluate` | `(actor, task, gate='complete')` | false |
-| `inbox.acknowledge` | `(actor, item, utterance)` | false |
+| `inbox.acknowledge` | `(actor, item, utterance, source=None, expected_digest=None)` | false |
 | `inbox.catalog` | `(actor, project, offset=0, limit=50, expected_snapshot=None)` | true |
 | `inbox.get` | `(actor, project)` | false |
 | `inbox.read` | `(actor, item, expected_digest, offset=0, byte_budget=12000)` | true |
 | `job.cancel` | `(actor, job, reason)` | false |
 | `job.get` | `(actor, job)` | true |
-| `job.list` | `(actor, project, limit=100)` | true |
+| `job.list` | `(actor, project, limit=100, offset=0, kind=None, status=None, task=None, subject=None, since=0, until=None, expected_snapshot=None)` | true |
 | `job.retry` | `(actor, job, reason)` | false |
 | `job.submit` | `(actor, kind, args, dedup=None, retry=None)` | false |
 | `local_execution.audit` | `(actor, local_execution, reviews=True, offset=0, limit=100)` | true |
@@ -134,12 +135,12 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `local_execution.packet` | `(actor, packet)` | true |
 | `local_execution.propose` | `(actor, program, subplan, tasks, rationale, stage_evidence, dispositions, byte_budget=24000, request_id=None)` | false |
 | `local_execution.withdraw` | `(actor, local_execution, expected_digest, reason, request_id=None)` | false |
-| `native.acknowledge` | `(actor, session, item, source, quote)` | false |
+| `native.acknowledge` | `(actor, session, item, source, quote, expected_digest=None)` | false |
 | `native.actions` | `(actor, session, actions, source=None)` | false |
 | `native.attach` | `(actor, session, cwd, project=None, name='New project', client='claude', register_repository=True)` | false |
 | `native.completion` | `(actor, session, subject)` | false |
 | `native.context` | `(actor, session)` | false |
-| `native.input` | `(actor, session, content, turn_id=None, origin='skill-relay')` | false |
+| `native.input` | `(actor, session, content, turn_id=None, origin='skill-relay', start_program=False)` | false |
 | `native.lookup` | `(actor, cwd)` | true |
 | `native.present_decision` | `(actor, session, decision)` | false |
 | `native.respond` | `(actor, session, decision, expected_digest, source, choice, quote)` | false |
@@ -170,6 +171,7 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `remote.status` | `(actor, delivery)` | true |
 | `repository.list` | `(actor, project)` | true |
 | `repository.register` | `(actor, project, name, path)` | false |
+| `request.result` | `(actor, request_id, expected_digest, offset=0, limit=65536)` | true |
 | `research.fetch` | `(actor, project, url, purpose)` | false |
 | `run.get` | `(actor, run)` | true |
 | `run.recovery` | `(actor, run, offset=0, limit=100, expected_digest=None)` | true |
@@ -198,7 +200,7 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `task.apply_revision` | `(actor, proposal, expected_digest, review_receipt)` | false |
 | `task.artifacts_collect` | `(actor, task, expected_revision, candidate, repository, path)` | false |
 | `task.cancel` | `(actor, task, reason)` | false |
-| `task.claim` | `(actor, project, task=None)` | false |
+| `task.claim` | `(actor, project, task=None, after_task=None, scan_limit=1000, adapter=None)` | false |
 | `task.complete` | `(actor, task, expected_revision)` | false |
 | `task.create` | `(actor, project, body)` | false |
 | `task.get` | `(actor, task)` | true |
@@ -207,6 +209,7 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `task.list` | `(actor, project, limit=100, offset=0)` | true |
 | `task.parallel_candidates` | `(actor, project, limit=100, offset=0)` | true |
 | `task.plan_tests` | `(actor, task, body, review_receipt=None)` | false |
+| `task.preflight` | `(actor, task, adapter)` | true |
 | `task.progress` | `(actor, task)` | true |
 | `task.propose_plan_revision` | `(actor, task, expected_revision, expected_plan_digest, body, reason, evidence_refs)` | false |
 | `task.propose_revision` | `(actor, task, expected_revision, body, reason)` | false |
@@ -243,7 +246,7 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `traceability.scope_propose` | `(actor, project, revision, program, scope_requirement, applicable_from='plan', mandatory=True, expected_head_record=None)` | false |
 | `waiver.close` | `(actor, waiver)` | false |
 | `waiver.request` | `(actor, project, subject, criterion, reason, expires, remediation_task, controls, decision=None)` | false |
-| `workflow.pause` | `(actor, project, task=None, paused=True)` | false |
+| `workflow.pause` | `(actor, project, task=None, paused=True, fence=False)` | false |
 | `workflow.reconcile` | `(actor, project=None)` | false |
 | `workflow.status` | `(actor, project)` | true |
 | `workflow.summary` | `(actor, project)` | true |

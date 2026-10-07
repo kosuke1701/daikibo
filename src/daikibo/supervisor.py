@@ -15,11 +15,11 @@ ALLOWED={
  'breakdown.upload_list','breakdown.upload_begin','breakdown.upload_put','breakdown.upload_status','breakdown.upload_finalize','breakdown.upload_abandon',
  'breakdown.units','breakdown.propose','breakdown.get','breakdown.packet','breakdown.audit','breakdown.activate','program.breakdown_status','program.status','program.completion','program.finish','program.reopen',
  'artifact.history','baseline.list','baseline.get','baseline.verify','baseline.export','baseline.rebuild_git','baseline.inspect_archive',
- 'run.work_changes','run.work_read','execution.usage','job.retry','source.partition','source.partition_status','source.packet','source.read','source.classify','source.coverage','artifact.propose','artifact.get','artifact.list','artifact.revise','artifact.accept',
+ 'run.work_changes','run.work_read','execution.usage','job.retry','source.partition','source.partition_status','source.packet','source.read','source.classify','source.coverage','artifact.propose','artifact.get','artifact.list','artifact.revise','artifact.save','artifact.accept',
  'trace.link','trace.impact','trace.audit','baseline.create','repository.list','program.next','program.advance','program.partition_review','program.review_summary','contract.compare','contract.propose_document','architecture.check','document.get',
  'change.propose','change.attempt','change.delta','change.apply','conflict.report','decision.propose','decision.apply','decision.get','decision.recent',
  'task.propose_revision','task.propose_plan_revision','task.revision_get','task.revision_list','task.apply_revision','task.withdraw_revision','task.revision_history','task.history_record',
- 'task.create','task.get','task.list','task.test_evidence','task.plan_tests','task.ready','task.replan','task.claim','workflow.status','workflow.pause',
+ 'task.create','task.get','task.list','task.test_evidence','task.preflight','task.plan_tests','task.ready','task.replan','task.claim','workflow.status','workflow.pause',
  'policy.get','policy.propose','inbox.get','job.submit','job.get','job.list','adapter.list','run.get','run.recovery','run.recovery_read','evidence.get',
  'context.build','context.fresh','code.search','code.consumers','code.read','code.inventory','delivery.prepare','delivery.get','delivery.certify','gate.evaluate','research.fetch',
  'traceability.propose','traceability.extract','traceability.get','traceability.list','traceability.items','traceability.read','traceability.diff',
@@ -109,7 +109,7 @@ class Supervisor:
         last=self.s.one('SELECT value FROM meta WHERE key=?',('supervisor:'+project,))
         if last:context['previous_turn']=parse_json(last['value'])
         contracts={name:str(__import__('inspect').signature(self.c.routes[name])) for name in sorted(ALLOWED) if name in self.c.routes}
-        contract_metadata={name:artifact_body_contract() for name in ('artifact.propose','artifact.revise') if name in contracts}
+        contract_metadata={name:artifact_body_contract() for name in ('artifact.propose','artifact.revise','artifact.save') if name in contracts}
         prompt={'role':'supervisor','managed_execution':{'role':'supervisor','job_id':getattr(self.c.rt.job_context,'id',None)},
                 'context':context,'contracts':contracts,'contract_metadata':contract_metadata,
                 'instructions':[
@@ -151,7 +151,10 @@ class Supervisor:
             if isinstance(value,dict):return {k:resolve(v,depth+1) for k,v in value.items()}
             if isinstance(value,list):return [resolve(v,depth+1) for v in value]
             return value
-        for action in proposal['actions']:
+        from .action_batches import preflight
+        rejected = preflight(self.c, agent, proposal['actions'], ALLOWED, 'forbidden')
+        if rejected: results.append(rejected)
+        for action in ([] if rejected else proposal['actions']):
             try:
                 obj(action,required=('method','params'),optional=('as',));need(action['method'] in ALLOWED,'forbidden','Planner cannot invoke owner-only or collector operations')
                 params=resolve(action['params']);result=self.c.invoke(agent,action['method'],params)

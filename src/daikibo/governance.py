@@ -78,6 +78,10 @@ class Governance:
         # Governance uses this only to honor a reviewed recovery admission
         # while preserving every other currentness gate.
         self.execution_controls=None
+        # Runtime owns the canonical review-material builders. Standalone
+        # readers may bind that same provider, but must not synthesize a
+        # weaker replacement when it is unavailable.
+        self.review_materials=None
         # Set by the composition root after Breakdowns is constructed.  Keeping
         # this optional preserves the small standalone governance fixtures while
         # allowing local authorization to return to the formally adopted root
@@ -88,7 +92,7 @@ class Governance:
 
     def _bind_composition(self, *, assurance=None, breakdowns=None,
                           local_executions=None, traceability=None,
-                          workflow=None):
+                          workflow=None, review_materials=None):
         """Bind existing services for a small internal reader composition.
 
         Standalone readers use the same retained Store and service instances as
@@ -100,6 +104,7 @@ class Governance:
             ("assurance", assurance), ("breakdowns", breakdowns),
             ("local_executions", local_executions),
             ("traceability", traceability), ("workflow", workflow),
+            ("review_materials", review_materials),
         ):
             if value is not None:
                 setattr(self, name, value)
@@ -158,9 +163,69 @@ class Governance:
         for output in body.get('result',{}).get('build_outputs',[])+body.get('result',{}).get('build_inputs',[]):self.s.blob_get(output['blob'])
         return body
 
-    def require_review(self, ident, subject, binding, roles):
+    def _require_governed_review_environment(self, body):
+        need(body.get('assurance')=='governed' and not body.get('simulated'),
+             "unqualified_execution", "Review lacks governed live execution")
+        run=self.s.one('SELECT adapter FROM runs WHERE id=?',(body['run'],),True)
+        adapter=self.s.one('SELECT qualified,receipt FROM adapters WHERE name=?',(run['adapter'],),True)
+        need(adapter['qualified'] and adapter['receipt'],'adapter_unqualified',
+             'Actual CLI protocol qualification is required')
+        qual=parse_json(adapter['receipt']);self.sec.verify(qual['record'],qual['key_id'],qual['mac'])
+        from .qualification import catalog
+        from .agents import Adapters
+        current_adapter=Adapters(self.s,self.sec,self.mode).get(run['adapter'])
+        need(qual['record'].get('catalog_digest')==catalog()['digest'],'adapter_unqualified',
+             'Qualification fixtures changed; a new real qualification run is required')
+        need(qual['record'].get('configuration_digest')==digest(
+                 {k:v for k,v in current_adapter.items() if k!='qualified'}),
+             'adapter_unqualified','Adapter configuration changed since qualification')
+
+    def _usable_review_judgment(self, body):
+        result=body.get('result')
+        if not (body.get('process_started') is True and body.get('exit_code') == 0 and
+                not any(body.get(x) for x in ('timed_out','cancelled','output_overflow',
+                                               'input_mutated','failure')) and
+                body.get('readonly_verified') is True and body.get('judgment_valid') is True and
+                isinstance(result,dict) and result.get('verdict') in {'pass','fail','blocked'} and
+                not result.get('error') and not result.get('collector_error')):
+            return False
+        if self.mode == 'governed':
+            try:
+                self._require_governed_review_environment(body)
+            except Fault:
+                return False
+        return True
+
+    def _require_latest_review(self, ident, body):
+        """Reject an older valid judgment only within its exact review family.
+
+        Invalid executions, malformed judgments, other roles, and other
+        bindings do not supersede a usable review. Valid fail/blocked judgments
+        do supersede an earlier PASS for the same subject, role, and material.
+        """
+        role=body.get('role')
+        rows=self.s.all(
+            'SELECT id FROM receipts WHERE project=? AND subject=? AND role=? AND binding=?',
+            (body['project'],body['subject'],role,body['binding']),
+        )
+        if not rows:
+            return
+        ordered=ordered_observed_receipts(
+            self, project=body['project'], subject=body['subject'], role=role,
+            binding=body['binding'], receipt_ids=[row['id'] for row in rows],
+        )
+        usable=[item for item in ordered if self._usable_review_judgment(item['body'])]
+        if usable:
+            latest=usable[-1]['row']['id']
+            need(latest==ident,'stale_evidence',
+                 'An older review cannot be used after a newer valid judgment for the same material',
+                 {'requested':ident,'latest':latest})
+
+    def require_review(self, ident, subject, binding, roles, *, latest=False):
         body=self.receipt(ident)
         need(body['subject']==subject and body['binding']==binding and body['role'] in roles,"stale_evidence","Review does not match required subject, role and version")
+        if latest:
+            self._require_latest_review(ident,body)
         need(body['result'].get('verdict')=='pass' and body['exit_code']==0 and not any(body.get(x) for x in ('timed_out','cancelled','output_overflow')),"review_failed","Review did not pass")
         need(body.get('readonly_verified') is True,"review_modified_input","Reviewer input was not unchanged")
         need(body.get('judgment_valid') is True,"invalid_review","Review output did not meet its schema")
@@ -179,16 +244,7 @@ class Governance:
                  'stale_evidence', 'Task test evidence changed after this review',
                  {'expected': material.get('selection_digest'), 'actual': current.get('selection_digest')})
         if self.mode=='governed':
-            need(body.get('assurance')=='governed' and not body.get('simulated'),"unqualified_execution","Review lacks governed live execution")
-            run=self.s.one('SELECT adapter FROM runs WHERE id=?',(body['run'],),True)
-            adapter=self.s.one('SELECT qualified,receipt FROM adapters WHERE name=?',(run['adapter'],),True)
-            need(adapter['qualified'] and adapter['receipt'],'adapter_unqualified','Actual CLI protocol qualification is required')
-            qual=parse_json(adapter['receipt']);self.sec.verify(qual['record'],qual['key_id'],qual['mac'])
-            from .qualification import catalog
-            from .agents import Adapters
-            current_adapter=Adapters(self.s,self.sec,self.mode).get(run['adapter'])
-            need(qual['record'].get('catalog_digest')==catalog()['digest'],'adapter_unqualified','Qualification fixtures changed; a new real qualification run is required')
-            need(qual['record'].get('configuration_digest')==digest({k:v for k,v in current_adapter.items() if k!='qualified'}),'adapter_unqualified','Adapter configuration changed since qualification')
+            self._require_governed_review_environment(body)
         return body
 
     def evidence_for(self, subject,binding,role):
@@ -890,8 +946,29 @@ class Governance:
 
     def inbox(self,project,kind,ref,body,severity='warning',due=None):
         ident=uid('INBOX')
-        self.s.execute("INSERT INTO inbox(id,project,kind,ref,body,severity,due,created) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(project,kind,ref) DO UPDATE SET body=excluded.body,severity=excluded.severity,status='open',due=excluded.due",
-                       (ident,project,kind,ref,canonical(body).decode(),severity,due,timestamp()))
+        encoded=canonical(body).decode()
+        with self.s.transaction():
+            existing=self.s.one('SELECT * FROM inbox WHERE project=? AND kind=? AND ref=?',(project,kind,ref))
+            if existing:
+                changed=(existing['body']!=encoded or existing['severity']!=severity or existing['due']!=due)
+                # ``created`` is the start of the currently visible notice
+                # version. Keep it stable on an identical resend so existing
+                # responses remain bound to the same material.
+                version_created=timestamp() if changed else existing['created']
+                self.s.execute('UPDATE inbox SET body=?,severity=?,status=\'open\',due=?,created=? WHERE id=?',
+                               (encoded,severity,due,version_created,existing['id']))
+                item=existing['id']
+            else:
+                self.s.execute('INSERT INTO inbox(id,project,kind,ref,body,severity,due,created) VALUES(?,?,?,?,?,?,?,?)',
+                               (ident,project,kind,ref,encoded,severity,due,timestamp()))
+                item=ident;changed=True
+            if changed:
+                published=self.s.one('SELECT body,severity,due FROM inbox WHERE id=?',(item,),True)
+                body_digest=digest(published['body'].encode())
+                self.sec.event(project,'notification_published','daikibo-governance',
+                               {'item':item,'kind':kind,'ref':ref,'body_digest':body_digest,
+                                'version_digest':digest({'body_digest':body_digest,'severity':published['severity'],
+                                                         'due':published['due']})})
 
     def policy_propose(self,actor,project,body):
         actor.require('owner','agent',project=project)

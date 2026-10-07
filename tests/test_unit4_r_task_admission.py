@@ -982,7 +982,9 @@ def test_standalone_bind_helper_reuses_the_canonical_readers(
         local_executions=full.local_executions,
         traceability=full.traceability,
         workflow=workflow,
+        review_materials=full.rt.review_materials,
     )
+    assert standalone.review_materials is full.rt.review_materials
     before = full.s.conn.total_changes
     result = inspect_task_admission(
         standalone, full.owner, task=flow["task"], checkpoint="claim",
@@ -990,6 +992,30 @@ def test_standalone_bind_helper_reuses_the_canonical_readers(
     assert result["allowed"] is True
     assert result["canonical_programs"] == [flow["program"]]
     assert full.s.conn.total_changes == before
+
+
+def test_standalone_admission_fails_closed_without_review_material_provider(
+    full, full_project, tmp_path,
+):
+    flow = _prepare_selected_stage(
+        full, full_project, tmp_path, omit_workflow=True, mature=True,
+    )
+    standalone = Governance(full.s, full.sec, full.k, mode="validation")
+    workflow = Workflow(full.s, full.sec, full.k, standalone)
+    standalone._bind_composition(
+        assurance=full.assurance,
+        breakdowns=full.breakdowns,
+        local_executions=full.local_executions,
+        traceability=full.traceability,
+        workflow=workflow,
+    )
+
+    result = inspect_task_admission(
+        standalone, full.owner, task=flow["task"], checkpoint="claim",
+    )
+    assert result["allowed"] is False
+    details = json.dumps(result, sort_keys=True, default=str)
+    assert "unverified_node_review" in details
 
 
 def test_standalone_workflow_claim_rechecks_invalid_current_plan(

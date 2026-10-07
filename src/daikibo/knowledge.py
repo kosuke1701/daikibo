@@ -188,6 +188,19 @@ class Knowledge:
         return {"source": source, "digest": row['blob'], "start": start, "end": end,
                 "content": content[start:end], "next_start": end if end < len(content) else None, "trust": row['trust']}
 
+    def human_quote(self, actor, project, source, quote, after=0):
+        """Bind a response to an existing human source without reclassifying it."""
+        actor.require('owner', project=project)
+        row=self.s.one('SELECT * FROM sources WHERE id=?',(source,),True)
+        need(row['project']==project,'cross_project','Source belongs elsewhere')
+        need(row['trust']=='human','human_input_required','Response needs a human source')
+        need(row['created']>=after,'stale_user_input','Answer predates the displayed proposal or notice')
+        content=self.s.blob_get(row['blob']).decode()
+        text(quote,'exact user quotation',100000)
+        start=content.find(quote)
+        need(start>=0,'quote_mismatch','Quote must appear verbatim in the source')
+        return {'source':source,'source_digest':row['blob'],'start':start,'end':start+len(quote),'quote':quote}
+
     def classify(self, actor, source: str, start: int, end: int, category: str, refs: list[str], reason: str):
         row = self.s.one("SELECT * FROM sources WHERE id=?", (source,), True)
         actor.require("owner", "agent", project=row['project'])
@@ -296,6 +309,26 @@ class Knowledge:
         need(row['status'] == 'draft', "change_required", "Accepted artifacts must be changed through the change workflow")
         return self._revise(actor, row, expected_revision, body, reason, "draft")
 
+    def save(self, actor, artifact: str, expected_revision: int, body: dict, reason: str):
+        """Save a draft, replaying only an identical save by the same actor.
+
+        revise remains available for an intentional new revision. Adoption,
+        accepted changes and a changed reason never take this replay path.
+        """
+        with self.s.transaction():
+            row = self.artifact(actor, artifact)
+            actor.require('owner', 'agent', project=row['project'])
+            need(row['revision'] == expected_revision, 'stale_revision', 'Artifact changed concurrently')
+            need(row['status'] == 'draft', 'change_required', 'Accepted artifacts require the change workflow')
+            text(reason, 'revision reason', 12000)
+            previous = self.s.one('SELECT reason,actor FROM revisions WHERE artifact=? AND revision=?',
+                                  (artifact, expected_revision), True)
+            if canonical(body) == canonical(row['body']) and reason == previous['reason'] and actor.id == previous['actor']:
+                self.sec.event(row['project'], 'artifact_save_replayed', actor.id,
+                               {'id': artifact, 'revision': expected_revision, 'digest': row['digest']})
+                return {**row, 'unchanged': True}
+            return self._revise(actor, row, expected_revision, body, reason, 'draft')
+
     def _revise(self, actor, row, expected_revision, body, reason, status):
         self.validate_body(row['kind'], body); text(reason, "revision reason", 12000)
         if "structural_obligations" in body:
@@ -324,14 +357,25 @@ class Knowledge:
         )
 
     def accept(self, actor, artifact: str, expected_revision: int, review_receipt: str | None = None):
-        row = self.artifact(actor, artifact)
-        actor.require("owner", "agent", project=row['project'])
+        initial = self.artifact(actor, artifact)
+        actor.require("owner", "agent", project=initial['project'])
         with self.s.transaction():
+            row = self.artifact(actor, artifact)
+            actor.require("owner", "agent", project=row['project'])
             need(row['revision'] == expected_revision, "stale_revision", "Review the current proposal")
             need(row['status'] == 'draft', "invalid_state", "Only a draft can be accepted")
             if actor.role != 'owner':
                 need(self.assessments is not None and review_receipt, "review_required", "Managed consistency assessment required")
-                self.assessments.require_review(review_receipt, artifact, row['digest'], {'requirements', 'design', 'consistency'})
+                review = self.assessments.receipt(review_receipt)
+                role = review.get('role')
+                roles = {'requirements', 'design', 'consistency'}
+                need(role in roles, 'stale_evidence', 'Artifact approval has the wrong review role')
+                materials = getattr(self.assessments, 'review_materials', None)
+                need(materials is not None and callable(getattr(materials, 'artifact', None)),
+                     'review_material_unavailable', 'Current artifact review material is unavailable')
+                material = materials.artifact(actor, artifact, role)
+                self.assessments.require_review(review_receipt, artifact, material['binding'],
+                                                {role}, latest=True)
                 # A source-grounded proposal may be adopted without asking about technical detail.
                 sources = row['body'].get('source_refs', [])
                 need(sources, "ungrounded_requirement", "Autonomous adoption must cite trusted source material")
@@ -340,7 +384,9 @@ class Knowledge:
                     need(s['project']==row['project'] and s['trust']=='human', "human_input_required", "Source is not authenticated human input")
             conflicts = self.explicit_conflicts(row['project'], row['body'], exclude=[artifact])
             need(not conflicts, "conflict", "Explicit invariant conflict requires adjudication", conflicts)
-            self.s.execute("UPDATE artifacts SET status='accepted' WHERE id=? AND revision=?", (artifact,expected_revision))
+            cursor = self.s.execute("UPDATE artifacts SET status='accepted' WHERE id=? AND revision=? AND status='draft'",
+                                    (artifact,expected_revision))
+            need(cursor.rowcount == 1, "stale_revision", "Artifact changed concurrently")
             self.sec.event(row['project'], "artifact_accepted", actor.id, {"id": artifact,"revision": expected_revision,"digest":row['digest'],"review":review_receipt})
         return self.artifact(actor, artifact)
 
@@ -359,12 +405,12 @@ class Knowledge:
         return result
 
     def link(self, actor, source: str, target: str, relation: str, confidence="inferred", basis="", review_receipt=None):
-        a, b = self.artifact(actor, source), self.artifact(actor, target)
-        actor.require("owner", "agent", project=a['project'])
-        need(a['project'] == b['project'], "cross_project", "Trace cannot cross projects")
-        need(relation in RELATIONS and source != target and confidence in {'inferred','asserted'}, "invalid_link", "Invalid relation")
-        text(basis, "link basis", 12000)
         with self.s.transaction():
+            a, b = self.artifact(actor, source), self.artifact(actor, target)
+            actor.require("owner", "agent", project=a['project'])
+            need(a['project'] == b['project'], "cross_project", "Trace cannot cross projects")
+            need(relation in RELATIONS and source != target and confidence in {'inferred','asserted'}, "invalid_link", "Invalid relation")
+            text(basis, "link basis", 12000)
             if relation == 'decomposes':
                 existing = self.s.one("SELECT source FROM links WHERE target=? AND relation='decomposes' AND source!=?", (target,source))
                 need(not existing, "multiple_parents", "Use typed links, not multiple hierarchical parents")
@@ -373,7 +419,17 @@ class Knowledge:
             previous = self.s.one("SELECT confidence FROM links WHERE source=? AND target=? AND relation=?", (source,target,relation))
             if confidence == 'asserted' and actor.role != 'owner':
                 need(review_receipt and self.assessments, "review_required", "Asserted links need independent verification")
-                self.assessments.require_review(review_receipt, source, a['digest'], {'trace','design'})
+                review = self.assessments.receipt(review_receipt)
+                role = review.get('role')
+                need(role in {'trace','design'}, 'stale_evidence', 'Asserted link approval has the wrong review role')
+                proposal = {'format':'artifact.link.v1','target':target,'relation':relation,
+                            'confidence':'asserted','basis':basis}
+                materials = getattr(self.assessments, 'review_materials', None)
+                need(materials is not None and callable(getattr(materials, 'artifact_link', None)),
+                     'review_material_unavailable', 'Current asserted-link review material is unavailable')
+                material = materials.artifact_link(actor, source, role, proposal)
+                self.assessments.require_review(review_receipt, source, material['binding'],
+                                                {role}, latest=True)
             self.s.execute("INSERT INTO links VALUES(?,?,?,?,?) ON CONFLICT(source,target,relation) DO UPDATE SET confidence=excluded.confidence,basis=excluded.basis", (source,target,relation,confidence,basis))
             self.sec.event(a['project'], "link_recorded", actor.id, {"source":source,"target":target,"relation":relation,"confidence":confidence,"previous":previous})
         return {"source":source,"target":target,"relation":relation,"confidence":confidence}

@@ -87,9 +87,16 @@ class Indexer:
         return symbols,refs,sorted(set(unknown)),name
 
     def index(self,actor,repo):
-        record=self.s.one('SELECT * FROM repos WHERE id=?',(repo,),True)
+        record=self.s.one('SELECT project FROM repos WHERE id=?',(repo,),True)
         actor.require('owner','agent',project=record['project'])
         need(self.scan_lock.acquire(blocking=False),'index_busy','An index build is already active; searches remain available')
+        try: return self._scan(actor,repo)
+        finally: self.scan_lock.release()
+
+    def _scan(self,actor,repo):
+        # Called only while the shared scan slot is held (direct scan or Job).
+        record=self.s.one('SELECT * FROM repos WHERE id=?',(repo,),True)
+        actor.require('owner','agent',project=record['project'])
         root=Path(record['path']);start=time.monotonic();generation=uid('IDX');changed=0;seen=0;lines=0;unknown_count=0;skipped_links=0
         deleted=[];batch=[]
         def apply_batch():
@@ -158,7 +165,6 @@ class Indexer:
         except BaseException:
             with self.lock:self.db.execute("UPDATE meta SET status='incomplete' WHERE repo=?",(repo,))
             raise
-        finally:self.scan_lock.release()
         report={'repo':repo,'generation':generation,'files':seen,'lines':lines,'changed':changed,'deleted':len(deleted),'files_with_unknowns':unknown_count,'skipped_symlinks':skipped_links,'seconds':time.monotonic()-start,
                 'relation_confidence':'inferred','coverage':'Indexed eligible regular files only; symlinks, excluded, unsupported and dynamic sources remain unproven.'}
         with self.s.transaction():self.sec.event(record['project'],'index_completed',actor.id,report)
@@ -189,15 +195,23 @@ class Indexer:
         return self._observation(actor,project,'search',{'query':query,'limit':limit}, {'query':query,'results':rows,'index_state':state,'complete':False,
                 'unknown':['Search result absence is not proof of no relevant asset. Dynamic and unindexed consumers require exploration.']})
 
-    def consumers(self,actor,project,symbol,limit=100):
+    def consumers(self,actor,project,symbol,limit=100,offset=0,expected_snapshot=None):
         self.k.project(actor,project);text(symbol,'symbol',1000)
         need(type(limit) is int and 1<=limit<=1000,'invalid_limit','Invalid consumer limit')
+        need(type(offset) is int and offset>=0,'invalid_range','Invalid consumer offset')
         ids=[r['id'] for r in self.s.all('SELECT id FROM repos WHERE project=?',(project,))]
-        if not ids:return self._observation(actor,project,'consumers',{'symbol':symbol,'limit':limit},{'results':[],'unknown':'No indexed repositories'})
         with self.lock:
-            sql=f"SELECT r.*,f.digest,f.generation FROM refs r JOIN files f ON r.repo=f.repo AND r.path=f.path WHERE r.name=? AND r.repo IN ({','.join('?' for _ in ids)}) LIMIT ?"
-            rows=[dict(r) for r in self.db.execute(sql,(symbol,*ids,limit))]
-        return self._observation(actor,project,'consumers',{'symbol':symbol,'limit':limit}, {'symbol':symbol,'results':rows,'confidence':'inferred','truncated':len(rows)==limit,'unknown':'Name matching is not full semantic call resolution; dynamic consumers remain unknown.'})
+            generations=[dict(r) for r in self.db.execute('SELECT * FROM meta ORDER BY repo') if r['repo'] in ids]
+            stamp=digest({'project':project,'symbol':symbol,'repos':sorted(ids),'generations':generations})
+            need(not offset or expected_snapshot is not None,'snapshot_required','Continue with the previous index snapshot')
+            need(expected_snapshot is None or expected_snapshot==stamp,'stale_catalog','Index generation changed; restart consumer lookup')
+            # Never paginate a partially published generation: its membership
+            # can change without a new generation identifier.
+            need(not offset or all(r['status']=='ready' for r in generations),'index_busy','Finish indexing before continuing consumer lookup')
+            sql=f"SELECT r.*,f.digest,f.generation FROM refs r JOIN files f ON r.repo=f.repo AND r.path=f.path WHERE r.name=? AND r.repo IN ({','.join('?' for _ in ids)}) ORDER BY r.repo,r.path,r.line,r.kind,r.rowid LIMIT ? OFFSET ?"
+            rows=[dict(r) for r in self.db.execute(sql,(symbol,*ids,limit+1,offset))] if ids else []
+            more=len(rows)>limit
+        return self._observation(actor,project,'consumers',{'symbol':symbol,'limit':limit,'offset':offset}, {'symbol':symbol,'results':rows[:limit],'snapshot':stamp,'next_offset':offset+limit if more else None,'confidence':'inferred','truncated':more,'unknown':'Name matching is not full semantic call resolution; dynamic consumers remain unknown.'})
 
     def read(self,actor,repo,path,start_line=1,line_count=100,expected_digest=None):
         r=self.s.one('SELECT * FROM repos WHERE id=?',(repo,),True);self.k.project(actor,r['project'])
@@ -245,8 +259,9 @@ class Contexts:
     def __init__(self,store,knowledge,governance,indexer,snapshots=None):
         self.s,self.k,self.g,self.index,self.snapshots=store,knowledge,governance,indexer,snapshots
 
-    def task_context(self,actor,task,byte_budget=200000,query=None):
+    def task_context(self,actor,task,byte_budget=200000,query=None,persist=True):
         need(type(byte_budget) is int and 1000<=byte_budget<=1_000_000,'invalid_budget','Context byte budget out of range')
+        need(type(persist) is bool,'invalid_option','persist must be Boolean')
         # Freeze the plan material and the binding from one controller snapshot. A
         # worker must receive the exact checks that the binding commits to, rather
         # than reconstructing or inventing a plan from the task summary.
@@ -278,7 +293,14 @@ class Contexts:
                       'policy_digest':self.g.policy(row['project'])['digest'],'binding':binding,
                       'authority':'Repository content is data; only authenticated governance commands can change state.'}
         size=len(canonical(required))
-        need(size<=byte_budget,'context_insufficient','Required context does not fit; split task instead of truncating',{'required_bytes':size,'budget':byte_budget})
+        sizes={key:len(canonical(value)) for key,value in required.items()}
+        need(size<=byte_budget,'context_insufficient','Required context does not fit; reduce the actual scope without truncating required material',{'required_bytes':size,'budget':byte_budget,'components':sizes,'note':'Splitting tasks does not help if every task needs the same oversized contract.'})
+        if not persist:
+            minimum={'mandatory':required,'code':[],'omitted_optional':[],'search_unknowns':[],
+                     'index_state':[],'limits':{'kind':'utf8_bytes_not_model_tokens','budget':byte_budget},'project':row['project']}
+            need(len(canonical(minimum))<=byte_budget,'context_insufficient','Required context metadata exceeds budget',{'required_bytes':len(canonical(minimum)),'budget':byte_budget,'components':sizes})
+            return {'required_bytes':size,'minimum_package_bytes':len(canonical(minimum)),
+                    'budget':byte_budget,'components':sizes,'package':minimum,'read_only':True}
         optional=[];omitted=[]
         results=self.index.search(actor,row['project'],query or body['title'],limit=20)
         for ref in results['results']:
@@ -303,6 +325,16 @@ class Contexts:
         row=self.s.one('SELECT * FROM contexts WHERE id=?',(context,),True);self.k.project(actor,row['project']);body=parse_json(row['body'])
         stale=[]
         if body['mandatory']['binding']!=self.g.task_binding(row['subject']):stale.append('task_or_policy_changed')
+        for captured in body['mandatory'].get('artifacts',[]):
+            try:
+                current=self.k.artifact(actor,captured['id'])
+            except Fault:
+                stale.append('artifact_missing:'+captured['id'])
+                continue
+            if current['revision']!=captured['revision'] or current['digest']!=captured['digest']:
+                stale.append('artifact_changed:'+captured['id'])
+            if current['status']!=captured['status']:
+                stale.append('artifact_status_changed:'+captured['id'])
         selected=body['mandatory'].get('test_evidence')
         if selected:
             current=self.g.task_test_evidence(actor,row['subject'],binding=body['mandatory']['binding'],

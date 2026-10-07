@@ -3649,7 +3649,7 @@ class Assurance:
             key=(packet_id,role);need(key in by_key,"invalid_review","Review reference is not required by this subject",key)
             need(key not in supplied,"duplicate_review","Duplicate assurance review reference",key)
             packet,required_role=by_key[key]
-            receipt=self.c.g.require_review(receipt_id,packet_id,packet["digest"],{required_role})
+            receipt=self.c.g.require_review(receipt_id,packet_id,packet["digest"],{required_role},latest=True)
             covered=receipt.get("result",{}).get("covered",[])
             need(isinstance(covered,list),"review_coverage","Review did not return coverage markers")
             required=set(packet["body"].get("required_coverage",[]))

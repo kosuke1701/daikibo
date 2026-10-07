@@ -187,6 +187,37 @@ class LocalExecutions:
             return source["blob"], "source"
         raise Fault("invalid_evidence", "Stage review receipt names no canonical subject", subject)
 
+    def _stage_receipt_binding(self, actor, project, receipt_id, *, observed=None,
+                               ensure_policy=True):
+        """Resolve review material separately from the subject's identity.
+
+        Stage packets and immutable subjects keep their existing digest
+        contract. Mutable artifacts and Tasks instead use the exact material
+        family that Runtime supplied to the reviewer, including a link
+        proposal or frozen test-plan baseline when present.
+        """
+        observed = observed or self.c.g.receipt(receipt_id)
+        need(observed.get("project") == project,
+             "cross_project", "Stage review receipt belongs elsewhere", receipt_id)
+        subject, role = observed.get("subject"), observed.get("role")
+        need(isinstance(subject, str) and isinstance(role, str),
+             "invalid_evidence", "Stage review receipt has no canonical subject or role", receipt_id)
+        identity_binding, subject_kind = self._stage_subject_binding(
+            actor, project, subject, ensure_policy=ensure_policy,
+        )
+        if subject_kind in {"artifact", "task"}:
+            materials = getattr(self.c.g, "review_materials", None)
+            need(materials is not None and callable(getattr(materials, "receipt_binding", None)),
+                 "review_material_unavailable",
+                 "Canonical Runtime review material is unavailable for this stage receipt")
+            binding = materials.receipt_binding(
+                actor, observed, ensure_policy=ensure_policy,
+            )
+            need(isinstance(binding, str), "stale_evidence",
+                 "Stage review material is no longer current", receipt_id)
+            return binding, subject_kind
+        return identity_binding, subject_kind
+
     def _source_inventory(self, project):
         result = []
         for row in self.s.all("SELECT id,project,blob,locator,characters,trust FROM sources WHERE project=? ORDER BY id", (project,)):
@@ -377,7 +408,7 @@ class LocalExecutions:
         if reference["kind"] != "receipt":
             raise Fault("invalid_evidence", "Unsupported stage evidence reference", reference)
         subject=reference["subject"]
-        binding,subject_kind=self._stage_subject_binding(actor,project,subject)
+        _,subject_kind=self._stage_subject_binding(actor,project,subject)
         if subject_kind == "artifact":
             need(subject in allowed_artifacts or subject in documented_subjects,
                  "invalid_evidence","Stage review artifact is outside the selected canonical inputs",subject)
@@ -406,7 +437,8 @@ class LocalExecutions:
         # binding at proposal creation.  Later runtime claim/epoch/candidate
         # changes are excluded from semantic material and are checked through
         # Task semantic digests instead of self-invalidating this evidence.
-        self.c.g.require_review(reference["id"],subject,binding,{reference["role"]})
+        binding, _ = self._stage_receipt_binding(actor, project, reference["id"])
+        self.c.g.require_review(reference["id"],subject,binding,{reference["role"]},latest=True)
         return None
 
     def _normalize_stage_evidence(self, actor, project, program, subplan, tasks, value):
@@ -484,13 +516,16 @@ class LocalExecutions:
                              and observed.get("judgment_valid") is True
                              and observed.get("readonly_verified") is True,
                              "invalid_evidence", "Stage review no longer has a passing observed verdict", reference["id"])
-                        binding, _ = self._stage_subject_binding(actor, project, observed["subject"],
-                                                                 ensure_policy=ensure_policy)
+                        binding, _ = self._stage_receipt_binding(
+                            actor, project, reference["id"], observed=observed,
+                            ensure_policy=ensure_policy,
+                        )
                         need(observed["binding"] == binding and reference.get("binding") == binding,
                              "stale_evidence", "Stage review subject binding changed after proposal", reference["id"])
                         need(observed.get("role") in STAGE_REVIEW_ROLES[stage],
                              "invalid_evidence", "Stage review role is not valid for this stage", [stage, reference.get("role")])
-                        self.c.g.require_review(reference["id"], observed["subject"], binding, {observed["role"]})
+                        self.c.g.require_review(reference["id"], observed["subject"], binding,
+                                                {observed["role"]}, latest=True)
                         if reference.get("task_semantic_digest"):
                             task_row=self.s.one("SELECT body,status,validity FROM tasks WHERE id=?",(observed["subject"],),True)
                             task_body=parse_json(task_row["body"])

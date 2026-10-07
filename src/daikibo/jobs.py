@@ -108,9 +108,27 @@ class Jobs:
             for key in ('result','error'):attempt[key]=parse_json(attempt[key]) if attempt[key] else None
         row.pop('actor',None);return row
 
-    def list(self,actor,project,limit=100):
+    def list(self,actor,project,limit=100,offset=0,kind=None,status=None,task=None,subject=None,since=0,until=None,expected_snapshot=None):
         self.c.k.project(actor,project);need(type(limit) is int and 1<=limit<=1000,'invalid_limit','Invalid job page size')
-        return {'jobs':self.s.all('SELECT id,kind,status,created,started,ended,cancelled,attempt_count,retry_due FROM jobs WHERE project=? ORDER BY created DESC LIMIT ?',(project,limit))}
+        need(type(offset) is int and offset>=0,'invalid_range','Invalid job offset')
+        if kind is not None: need(kind in KINDS,'invalid_job','Unknown job kind')
+        if status is not None: need(status in {'queued','running','retry_wait','succeeded','failed','unknown','cancelled'},'invalid_state','Unknown job status')
+        for value in (task,subject):
+            if value is not None: text(value,'subject filter',300)
+        number(since,'since',0,1e20)
+        if until is not None: number(until,'until',since,1e20)
+        with self.s.transaction():
+            rows=self.s.all('''SELECT id,kind,status,created,started,ended,cancelled,attempt_count,retry_due
+                FROM jobs WHERE project=? AND (? IS NULL OR kind=?) AND (? IS NULL OR status=?)
+                AND (? IS NULL OR json_extract(args,'$.task')=?)
+                AND (? IS NULL OR coalesce(json_extract(args,'$.subject'),json_extract(args,'$.task'),json_extract(args,'$.delivery'),json_extract(args,'$.repo'))=?)
+                AND created>=? AND (? IS NULL OR created<=?) ORDER BY created DESC,id DESC''',
+                (project,kind,kind,status,status,task,task,subject,subject,since,until,until))
+            stamp=digest({'project':project,'kind':kind,'status':status,'task':task,'subject':subject,'since':since,'until':until,'items':rows})
+            need(not offset or expected_snapshot is not None,'snapshot_required','Continue with the previous snapshot')
+            need(expected_snapshot is None or expected_snapshot==stamp,'stale_catalog','Job catalog changed; restart the filtered query')
+            return {'jobs':rows[offset:offset+limit],'total':len(rows),'snapshot':stamp,
+                    'next_offset':offset+limit if offset+limit<len(rows) else None}
 
     def retry(self,actor,job,reason):
         old=self.get(actor,job);actor.require('owner','agent',project=old['project']);text(reason,'retry/reconciliation reason',4000)
@@ -132,7 +150,7 @@ class Jobs:
             args=parse_json(row['args'])
             self.s.execute("UPDATE jobs SET cancelled=1,status=CASE WHEN status IN ('queued','retry_wait') THEN 'cancelled' ELSE status END,retry_due=NULL,ended=CASE WHEN status IN ('queued','retry_wait') THEN ? ELSE ended END WHERE id=?",(timestamp(),job))
             if row['kind'] in {'execute','tests'} and row['status']=='running':
-                self.c.w.pause(actor,row['project'],task=args['task'])
+                self.c.w.pause(actor,row['project'],task=args['task'],fence=True)
             self.c.sec.event(row['project'],'job_cancel_requested',actor.id,{'job':job,'reason':reason})
         return {'id':job,'cancel_requested':True,'warning':'A completed external side effect is not silently rolled back.'}
 
@@ -140,6 +158,17 @@ class Jobs:
         return Actor(**parse_json(row['actor']))
 
     def run_one(self,row):
+        current=self.s.one('SELECT * FROM jobs WHERE id=?',(row['id'],),True)
+        if current['kind']!='index' or current['status'] not in {'queued','retry_wait'} or current['cancelled']:
+            return self._run_one(current)
+        # Reserve the same slot used by direct scans BEFORE starting an attempt.
+        # Contention leaves the durable Job queued, without consuming retries.
+        if not self.c.idx.scan_lock.acquire(blocking=False):
+            return {'status':current['status'],'result':None,'error':None,'waiting_for':'index'}
+        try: return self._run_one(current)
+        finally: self.c.idx.scan_lock.release()
+
+    def _run_one(self,row):
         # Atomic dispatch prevents two scheduler callbacks from running the same attempt.
         with self.s.transaction():
             current=self.s.one('SELECT * FROM jobs WHERE id=?',(row['id'],),True);now=timestamp()
@@ -165,7 +194,7 @@ class Jobs:
             # Expiry only governs auto-retries; initial queued work can still start normally.
             if attempt>1:
                 need(row['retry_deadline'] is None or timestamp()<=row['retry_deadline'],'retry_expired','Retry window expired')
-            fn={'execute':self.c.rt.execute,'review':self.c.rt.review,'tests':self.c.rt.tests,'index':self.c.idx.index,
+            fn={'execute':self.c.rt.execute,'review':self.c.rt.review,'tests':self.c.rt.tests,'index':self.c.idx._scan,
                 'delivery.verify':self.c.d.verify,'supervisor.turn':self.c.supervisor.turn,'adapter.qualify':self.c.supervisor.qualify,
                 'remote.publish':self.c.external.publish,'ops.backup':self.c.ops.backup,'ops.audit':self.c.ops.audit,'ops.gc':self.c.ops.garbage_collect,
                 'traceability.extract':self.c.traceability.extract}[kind]
@@ -292,7 +321,7 @@ class Jobs:
                 try:
                     task=self.c.w.task(actor,row['id']);binding=self.c.g.task_binding(row['id'])
                     if row['status']=='ready':
-                        claim=self.c.w.claim(actor,project,task=row['id'])
+                        claim=self.c.w.claim(actor,project,task=row['id'],adapter=config['adapter'])
                         if not claim:continue
                         result=self.submit(actor,'execute',{'task':row['id'],'adapter':config['adapter']},'auto:execute:'+binding)
                         capacity-=1;continue

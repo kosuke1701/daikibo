@@ -2777,7 +2777,7 @@ class Traceability:
             body = packet["body"]
             need(body.get("role") == expected_role, "invalid_review_packet", "Review role does not match adoption gate")
             need(body.get("binding") == self._packet_binding(body), "integrity_error", "Review packet binding differs", packet["id"])
-            receipt = self.c.g.require_review(receipt_id, packet["id"], body["binding"], {expected_role})
+            receipt = self.c.g.require_review(receipt_id, packet["id"], body["binding"], {expected_role}, latest=True)
             need(not receipt.get("simulated"), "unqualified_execution", "Traceability adoption requires an observed non-simulated review")
             need(receipt.get("subject") == packet["id"] and receipt.get("role") == expected_role,
                  "stale_evidence", "Review receipt subject or role differs")
@@ -3468,6 +3468,10 @@ class Traceability:
                 need(current_refs==material.get("commit_refs"),"stale_material","Delivered commit references changed")
 
     def adopt(self, actor, project, revision=None, expected_digest=None, review_refs=None, subject=None, expected_active=None, expected_head_record=None):
+        with self.s.transaction():
+            return self._adopt(actor,project,revision,expected_digest,review_refs,subject,expected_active,expected_head_record)
+
+    def _adopt(self, actor, project, revision=None, expected_digest=None, review_refs=None, subject=None, expected_active=None, expected_head_record=None):
         self._project(actor,project);actor.require("owner",project=project)
         need(isinstance(subject,str) and subject,"subject_required","Traceability adoption requires the exact proposal/packet subject")
         root_table,root_row,root_ref,prop_id=self._root_subject(actor,project,subject)

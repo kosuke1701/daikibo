@@ -172,10 +172,31 @@ class ExecutionControls:
                 continue
             try:
                 review = self.g.receipt(value["review"])
+                raw = self.s.blob_get(review["input_digest"])
+                prompt = parse_json(raw)
+                need(isinstance(prompt, dict) and isinstance(prompt.get("context"), dict),
+                     "invalid_evidence", "Requirement review prompt has no retained context")
+                artifact = prompt["context"].get("artifact", {})
+                need(isinstance(artifact, dict), "invalid_evidence",
+                     "Requirement review prompt has no retained artifact")
+                # This proves the material of the historical acceptance,
+                # rather than comparing it with today's policy/invariants.
+                # Both legacy body bindings and canonical material bindings
+                # retain the exact reviewed artifact in their saved prompt.
+                retained = {key: artifact.get(key) for key in
+                            ("id", "project", "kind", "revision", "digest", "body")}
+                expected = {key: requirement[key] for key in
+                            ("id", "project", "kind", "revision", "digest")}
+                expected["body"] = parse_json(requirement["body"])
+                material_matches = (retained == expected and
+                                    digest(raw) == review["input_digest"] and
+                                    prompt.get("subject") == review.get("subject") and
+                                    prompt.get("role") == review.get("role") and
+                                    prompt.get("binding") == review.get("binding"))
             except Fault:
                 continue
             if (review.get("subject") == requirement["id"]
-                    and review.get("binding") == requirement["digest"]
+                    and material_matches
                     and review.get("role") in {"requirements", "design", "consistency"}
                     and review.get("exit_code") == 0
                     and review.get("result", {}).get("verdict") == "pass"

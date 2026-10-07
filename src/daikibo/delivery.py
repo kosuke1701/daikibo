@@ -73,7 +73,37 @@ class Delivery:
             'read_only':True,
         }
 
+    def review_material(self,actor,project,proposal):
+        """Freeze the complete configuration review context and its dependencies."""
+        from .review_dependencies import accepted_invariants
+        self.k.project(actor,project)
+        need(isinstance(proposal,dict),'invalid_profile','Profile proposal must be an object')
+        with self.s.transaction():
+            requirements=[]
+            for ref in proposal.get('required_requirements',[]):
+                item=self.k.artifact(actor,ref)
+                need(item['project']==project and item['kind']=='requirement' and item['status']=='accepted',
+                     'invalid_scope','Required requirement must be current and accepted')
+                requirements.append(item)
+            tasks=[]
+            for ref in proposal.get('required_tasks',[]):
+                item=self.w.task(actor,ref)
+                need(item['project']==project,'invalid_scope','Required Task belongs elsewhere')
+                tasks.append({key:item[key] for key in ('id','revision','body')})
+            previous=self.s.one('SELECT body,digest FROM profiles WHERE project=?',(project,))
+            context={'profile':proposal,'previous':previous,
+                     'invariants':accepted_invariants(self.s,project),
+                     'requirements':requirements,'tasks':tasks,
+                     'policy_digest':self.g.policy(project)['digest']}
+            return {'format':'delivery-profile-review.v1','project':project,'context':context}
+
     def configure(self,actor,project,body,expected_digest=None,review_receipt=None):
+        # Review dependencies and the replaced profile must remain current
+        # through publication, including managed calls without an outer RPC transaction.
+        with self.s.transaction():
+            return self._configure(actor,project,body,expected_digest,review_receipt)
+
+    def _configure(self,actor,project,body,expected_digest=None,review_receipt=None):
         actor.require('owner',project=project)
         obj(body,required=('target_environment','checks','required_requirements','required_tasks','applicability','repo_order','rollback'),optional=('reason','remote','build_outputs','program'))
         text(body['target_environment'],'target environment',10000);text(body['rollback'],'rollback procedure',10000)
@@ -120,7 +150,8 @@ class Delivery:
         old=self.s.one('SELECT * FROM profiles WHERE project=?',(project,))
         if old:
             need(expected_digest==old['digest'] and review_receipt,'scope_change_required','Profile is frozen; authenticate a reviewed amendment')
-            self.g.require_review(review_receipt,project,digest(body),{'delivery_profile'})
+            material=self.review_material(actor,project,body)
+            self.g.require_review(review_receipt,project,digest(material),{'delivery_profile'},latest=True)
         scope={'requirements':sorted(body['required_requirements']),'tasks':sorted(body['required_tasks']),'policy':self.g.policy(project)['digest']}
         base=self.sn.capture(actor,project,body['repo_order'])
         stored={**body,'baseline_snapshot':base}

@@ -314,18 +314,40 @@ class TaskRevisions:
                 actor, row['task'], stored['proposed_plan'], stored['expected_plan_digest'],
                 [ref['id'] for ref in stored['evidence_refs']], before,
             )
-            need(digest(current) == digest(stored), 'stale_task_proposal',
+            need(self._same_material(current, stored), 'stale_task_proposal',
                  'Task, plan, candidate, evidence, dependency graph or policy changed; submit a new proposal')
             need(current['proposed_task'] == before['task']['body'], 'stale_task_proposal',
                  'Plan proposal Task definition identity changed')
             return row
         current = self.material(actor, row['task'], stored['proposed'])
-        need(digest(current) == digest(stored), 'stale_task_proposal',
+        need(self._same_material(current, stored), 'stale_task_proposal',
              'Task, inputs, dependency graph or policy changed; submit a new proposal')
         raw = {k: v for k, v in stored['proposed'].items() if k != 'task_kind'}
         need(self.validate(actor, current['before']['task'], raw) == stored['proposed'],
              'stale_task_proposal', 'Current validation no longer agrees with the proposal')
         return row
+
+    def _same_material(self, current, stored):
+        """Retain full observations; ignore only renewal telemetry in comparison.
+
+        Epoch, owner, status, candidate, plan, blocks and every other field are
+        still compared. An expired or missing running lease is never current.
+        """
+        def projection(material, live):
+            result = parse_json(canonical(material))
+            snapshots = [result['before'], *result.get('dependencies', [])]
+            for snapshot in snapshots:
+                task = snapshot['task']
+                if task['status'] == 'running':
+                    if not task.get('lease_until') or not task.get('lease_owner'):
+                        return None
+                    if live and task['lease_until'] <= timestamp():
+                        return None
+                    task.pop('lease_until', None)
+                    task.pop('updated', None)
+            return result
+        now, then = projection(current, True), projection(stored, False)
+        return now is not None and then is not None and canonical(now) == canonical(then)
 
     def review_subject(self, actor, proposal, role):
         need(role == 'impact', 'invalid_role', 'Task changes need an impact review')

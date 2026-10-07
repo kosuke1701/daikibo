@@ -236,13 +236,15 @@ class Planning:
     def change_review_material(self, change):
         """Return one consistent view used both by the prompt and by its binding."""
         from .contracts import interface_impact_context
+        from .review_dependencies import accepted_invariants
         with self.s.transaction():
             row=self.s.one("SELECT * FROM changes WHERE id=?",(change,),True)
             body=parse_json(row['body'])
-            material={'change':change,'revision':row['revision'],'body':body,
+            material={'change':change,'revision':row['revision'],'stage':row['stage'],'body':body,
                       'current':[{k:a[k] for k in ('id','revision','digest','status')}
                                  for a in [self.k.artifact(Actor('system','owner'),x) for x in body['affected']]],
-                      'policy':self.g.policy(row['project'])['digest']}
+                      'policy':self.g.policy(row['project'])['digest'],
+                      'invariants':accepted_invariants(self.s,row['project'])}
             impacts=interface_impact_context(self.k,row['project'],body.get('deltas',[]))
             if impacts:
                 material['interface_impact']=impacts
@@ -277,13 +279,26 @@ class Planning:
             self.sec.event(row['project'],'feasibility_attempt',actor.id,{'change':change,'level':level,'outcome':body['outcome'],'stage':next_stage})
         return {'id':ident,'stage':next_stage,'note':'Resource exhaustion is not proof of infeasibility.'}
 
-    def set_delta(self,actor,change,expected_revision,deltas,reason):
+    def set_delta(self,actor,change,expected_revision,deltas,reason,force_revision=False):
         row=self.s.one("SELECT * FROM changes WHERE id=?",(change,),True)
         actor.require('owner','agent',project=row['project']);text(reason,'reason',12000)
+        need(type(force_revision) is bool,'invalid_option','force_revision must be Boolean')
         with self.s.transaction():
+            row=self.s.one("SELECT * FROM changes WHERE id=?",(change,),True)
             need(row['revision']==expected_revision,'stale_revision','Change has been revised')
             self.validate_deltas(actor,row['project'],deltas)
-            body=parse_json(row['body']);body['deltas']=deltas;body.setdefault('delta_history',[]).append({'reason':reason,'revision':expected_revision})
+            body=parse_json(row['body'])
+            history=body.get('delta_history',[])
+            if (not force_revision and history and history[-1].get('actor')==actor.id
+                and history[-1]['revision']==expected_revision-1 and history[-1].get('stage')==row['stage']
+                and history[-1]['reason']==reason and canonical(body.get('deltas',[]))==canonical(deltas)):
+                for ref in body['baseline_refs']:
+                    art=self.k.artifact(actor,ref['id'])
+                    need(art['revision']==ref['revision'] and art['digest']==ref['digest'],
+                         'stale_revision','Change baseline is no longer current')
+                self.sec.event(row['project'],'change_delta_replayed',actor.id,{'change':change,'revision':expected_revision})
+                return {'id':change,'revision':expected_revision,'binding':self.change_binding(change),'unchanged':True}
+            body['deltas']=deltas;body.setdefault('delta_history',[]).append({'reason':reason,'revision':expected_revision,'actor':actor.id,'stage':row['stage']})
             self.s.execute("UPDATE changes SET body=?,revision=revision+1 WHERE id=?",(canonical(body).decode(),change))
             self.s.execute("UPDATE decisions SET status='superseded' WHERE project=? AND status IN ('pending','decision_received') AND json_extract(body,'$.change')=?",(row['project'],change))
             self.sec.event(row['project'],'change_delta_revised',actor.id,{'change':change,'revision':expected_revision+1})
@@ -305,12 +320,25 @@ class Planning:
             self.sec.event(project,'conflict_recorded',actor.id,{'id':ident,'impact':impact})
         return {'id':ident,'body':body,'impact':impact}
 
+    def provisional_review_material(self,project,body):
+        from .review_dependencies import accepted_invariants
+        with self.s.transaction():
+            clean={k:v for k,v in body.items() if k not in {'consistency_receipt','bindings'}}
+            artifacts=[self.k.artifact(Actor('control','owner'),x) for x in clean.get('refs',[])]
+            need(all(a['project']==project for a in artifacts),'cross_project','Decision reference belongs elsewhere')
+            return {'format':'provisional-decision-review.v1','project':project,'proposal':clean,
+                    'refs':[{k:a[k] for k in ('id','revision','digest')} for a in artifacts],
+                    'invariants':accepted_invariants(self.s,project),
+                    'policy':self.g.policy(project)['digest']}
+
     def provisional_binding(self,project,body):
-        clean={k:v for k,v in body.items() if k not in {'consistency_receipt','bindings'}}
-        refs=[{k:a[k] for k in ('id','revision','digest')} for a in [self.k.artifact(Actor('control','owner'),x) for x in clean.get('refs',[])]]
-        return digest({'proposal':clean,'refs':refs,'policy':self.g.policy(project)['digest']})
+        return digest(self.provisional_review_material(project,body))
 
     def propose_decision(self,actor,project,body):
+        with self.s.transaction():
+            return self._propose_decision(actor,project,body)
+
+    def _propose_decision(self,actor,project,body):
         actor.require('owner','agent',project=project)
         obj(body,required=('title','reason','options','recommendation','refs','requirement_affecting'),
             optional=('change','conflict','supersedes','provisional','expires','reversible','consistency_receipt'))
@@ -331,7 +359,7 @@ class Planning:
             need(body.get('consistency_receipt'),'review_required','Provisional decision requires consistency check')
             subject=body['refs'][0] if body['refs'] else None
             need(subject,'invalid_decision','Provisional decisions need a scope reference')
-            self.g.require_review(body['consistency_receipt'],project,self.provisional_binding(project,body),{'decision_proposal'})
+            self.g.require_review(body['consistency_receipt'],project,self.provisional_binding(project,body),{'decision_proposal'},latest=True)
         ident=uid('DEC');h=digest(body)
         with self.s.transaction():
             self.s.execute("INSERT INTO decisions VALUES(?,?,?,?,?,?,?,?,?,?)",(ident,project,1,canonical(body).decode(),h,'provisional' if provisional else 'pending',None,None,None,timestamp()))
@@ -345,7 +373,7 @@ class Planning:
             self.sec.event(project,'decision_proposed',actor.id,{'id':ident,'digest':h,'provisional':provisional})
         return {'id':ident,'revision':1,'digest':h,'body':body}
 
-    def respond(self,actor,decision,expected_digest,choice,utterance):
+    def respond(self,actor,decision,expected_digest,choice,utterance,source=None):
         actor.require('owner')
         row=self.s.one("SELECT * FROM decisions WHERE id=?",(decision,),True)
         body=parse_json(row['body']);text(utterance,'human utterance',100000)
@@ -357,24 +385,36 @@ class Planning:
                 current=self.k.artifact(actor,ref['id'])
                 need(current['revision']==ref['revision'] and current['digest']==ref['digest'],'stale_decision','A bound requirement changed')
             if body.get('change'): need(body['change_binding']==self.change_binding(body['change']),'stale_decision','Change proposal changed')
-            src=self.k.source(actor,row['project'],utterance,'trusted-dialogue:'+decision)
-            self.k.classify(actor,src['id'],0,len(utterance),'reference',[],'Authenticated response to exact versioned decision '+decision)
+            if source is None:
+                src=self.k.source(actor,row['project'],utterance,'trusted-dialogue:'+decision)
+                self.k.classify(actor,src['id'],0,len(utterance),'reference',[],'Authenticated response to exact versioned decision '+decision)
+                quote={'source':src['id'],'start':0,'end':len(utterance),'quote':utterance}
+            else:
+                quote=self.k.human_quote(actor,row['project'],source,utterance,after=row['created'])
+            source_id=quote['source']
             status='rejected' if choice=='reject' else 'deferred' if choice=='defer' else 'decision_received'
-            self.s.execute("UPDATE decisions SET status=?,response=?,source=? WHERE id=?",(status,choice,src['id'],decision))
+            self.s.execute("UPDATE decisions SET status=?,response=?,source=? WHERE id=?",(status,choice,source_id,decision))
             if status=='rejected':
                 self.s.execute("UPDATE inbox SET status='acknowledged' WHERE project=? AND ref=?",(row['project'],decision))
                 self.s.execute("DELETE FROM blocks WHERE kind='decision' AND ref=?",(decision,))
                 # Rejection doesn't make old code current: tasks still need explicit reassessment.
-            self.sec.event(row['project'],'human_response_observed',actor.id,{'decision':decision,'digest':expected_digest,'choice':choice,'source':src['id']})
+            self.sec.event(row['project'],'human_response_observed',actor.id,{'decision':decision,'digest':expected_digest,'choice':choice,**quote})
         return {'id':decision,'status':status,'consistency_recheck_required':status=='decision_received'}
 
     def decision_binding(self,decision):
         row=self.s.one("SELECT * FROM decisions WHERE id=?",(decision,),True)
-        body=parse_json(row['body'])
+        response_evidence=self.response_evidence(decision)
         return digest({'decision':decision,'digest':row['digest'],'response':row['response'],'source':row['source'],
+                       **({'response_evidence':response_evidence} if response_evidence else {}),
                        'current_artifacts':self.s.all("SELECT id,revision,digest FROM artifacts WHERE project=? AND status='accepted' ORDER BY id",(row['project'],)),
                        'other_decisions':self.s.all("SELECT id,digest,status,response FROM decisions WHERE project=? AND id!=? AND status IN ('applied','provisional','decision_received') ORDER BY id",(row['project'],decision)),
                        'policy':self.g.policy(row['project'])['digest']})
+
+    def response_evidence(self,decision):
+        event=self.s.one("SELECT id,actor,body FROM events WHERE kind='human_response_observed' AND json_extract(body,'$.decision')=? ORDER BY seq DESC LIMIT 1",(decision,))
+        if event and 'quote' in parse_json(event['body']):
+            return {**event,'body':parse_json(event['body'])}
+        return None
 
     def apply_decision(self,actor,decision,review_receipt):
         row=self.s.one("SELECT * FROM decisions WHERE id=?",(decision,),True)
@@ -416,15 +456,15 @@ class Planning:
         return {'id':decision,'status':'applied'}
 
     def apply_technical_change(self,actor,change,review_receipt):
-        row=self.s.one("SELECT * FROM changes WHERE id=?",(change,),True)
-        actor.require('owner','agent',project=row['project'])
-        need(row['stage']=='reconciling','invalid_stage','Record a specification-preserving solution first')
-        body=parse_json(row['body'])
-        for delta in body.get('deltas',[]):
-            art=self.k.artifact(actor,delta['artifact'])
-            need(art['kind'] not in {'requirement','acceptance','outcome','decision'},'product_decision_required','Technical change cannot silently modify product semantics')
         with self.s.transaction():
-            self.g.require_review(review_receipt,change,self.change_binding(change),{'consistency'})
+            row=self.s.one("SELECT * FROM changes WHERE id=?",(change,),True)
+            actor.require('owner','agent',project=row['project'])
+            need(row['stage']=='reconciling','invalid_stage','Record a specification-preserving solution first')
+            body=parse_json(row['body'])
+            for delta in body.get('deltas',[]):
+                art=self.k.artifact(actor,delta['artifact'])
+                need(art['kind'] not in {'requirement','acceptance','outcome','decision'},'product_decision_required','Technical change cannot silently modify product semantics')
+            self.g.require_review(review_receipt,change,self.change_binding(change),{'consistency'},latest=True)
             return self._apply_change(actor,change,review_receipt,None)
 
     def _apply_change(self,actor,change,receipt,decision):

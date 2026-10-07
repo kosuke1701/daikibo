@@ -72,6 +72,9 @@ class Control:
         # writer; no duplicate runtime assurance store is permitted.
         self.rt.assurance=self.assurance
         self.routes={};self.read_routes=set();self._register_routes();self.closed=False
+        self.register('task.preflight',self.rt.preflight,read=True)
+        self.register('request.result',self.request_result,read=True)
+        self.w.preflight=self.rt.preflight
         for method,function in {'artifact.history':self.history.artifact_history,'baseline.list':self.history.list,
                                 'baseline.get':self.history.get,'baseline.verify':self.history.verify,
                                 'baseline.export':self.history.export_archive,'baseline.rebuild_git':self.history.rebuild_git,
@@ -231,7 +234,7 @@ class Control:
         routes={
           'project.create':self.k.create_project,'project.get':self.k.project,
           'source.add':self.k.source,'source.read':self.k.source_read,'source.classify':self.k.classify,'source.coverage':self.k.source_coverage,
-          'artifact.propose':self.k.propose,'artifact.get':self.k.artifact,'artifact.list':self.k.list_artifacts,'artifact.revise':self.k.revise,'artifact.accept':self.k.accept,
+          'artifact.propose':self.k.propose,'artifact.get':self.k.artifact,'artifact.list':self.k.list_artifacts,'artifact.revise':self.k.revise,'artifact.save':self.k.save,'artifact.accept':self.k.accept,
           'trace.link':self.k.link,'trace.impact':self.k.impact,'trace.audit':self.k.trace,'baseline.create':self.k.baseline,'project.export':self.k.export,
           'repository.register':self.sn.register,'repository.list':self.repository_list,
           'program.begin':self.p.begin,'program.next':self.p.next,'program.advance':self.p.advance,
@@ -339,7 +342,7 @@ class Control:
                 if previous:
                     need(previous['request_digest']==request_digest,
                          'idempotency_conflict','Request ID was reused for different content')
-                    previous_result=parse_json(previous['result'])
+                    previous_result=parse_json(previous['result'],limit=len(previous['result'].encode()))
                     if not (isinstance(previous_result,dict) and previous_result.get('format')==pending_format):
                         return previous_result
                 else:
@@ -367,17 +370,40 @@ class Control:
         actor=self.sec.authenticate(token);method=request['method'];h=digest(request)
         if method in self.read_routes:return self.invoke(actor,method,request['params'])
         if method=='delivery.commit':
-            return self._request_delivery_commit(actor,request,h)
+            return self._bounded_response(request,self._request_delivery_commit(actor,request,h))
         # Mutating control commands and their idempotency result commit atomically.
         # Long execution only enters via a durable job; no process is started here.
         with self.s.transaction():
             previous=self.s.one('SELECT request_digest,result FROM requests WHERE actor=? AND id=?',(actor.id,request['id']))
             if previous:
                 need(previous['request_digest']==h,'idempotency_conflict','Request ID was reused for different content')
-                return parse_json(previous['result'])
+                return self._bounded_response(request,parse_json(previous['result'],limit=len(previous['result'].encode())))
             result=self.invoke(actor,method,request['params'])
             self.s.execute('INSERT INTO requests VALUES(?,?,?,?,?)',(actor.id,request['id'],h,canonical(result).decode(),timestamp()))
+            return self._bounded_response(request,result)
+
+    def _bounded_response(self,request,result):
+        from .rpc import MAX_FRAME
+        if len(canonical({'ok':True,'result':result}))<=MAX_FRAME:
             return result
+        data=canonical(result)
+        return {'format':'daikibo.rpc-result-reference.v1','request_id':request['id'],
+                'sha256':digest(data),'bytes':len(data),'read_operation':'request.result'}
+
+    def request_result(self,actor,request_id,expected_digest,offset=0,limit=65536):
+        """Read only this actor's saved, exact request result in bounded chunks."""
+        import base64
+        text(request_id,'request ID',128)
+        need(type(offset) is int and offset>=0 and type(limit) is int and 1<=limit<=65536,
+             'invalid_range','Invalid result range')
+        row=self.s.one('SELECT result FROM requests WHERE actor=? AND id=?',(actor.id,request_id),True)
+        data=row['result'].encode();sha=digest(data)
+        need(expected_digest==sha,'stale_result','Saved request result differs')
+        need(offset<=len(data),'invalid_range','Offset exceeds result size')
+        chunk=data[offset:offset+limit];end=offset+len(chunk)
+        return {'request_id':request_id,'sha256':sha,'bytes':len(data),'offset':offset,
+                'end':end,'base64':base64.b64encode(chunk).decode(),
+                'next_offset':end if end<len(data) else None}
 
     def repository_list(self,actor,project):
         self.k.project(actor,project)
@@ -443,7 +469,7 @@ class Control:
             if method is not None and name != method:
                 continue
             descriptor={'signature':str(inspect.signature(fn)),'read_only':name in self.read_routes}
-            if name in {'artifact.propose','artifact.revise'}:
+            if name in {'artifact.propose','artifact.revise','artifact.save'}:
                 descriptor['body_contract']=artifact_body_contract()
                 descriptor['description'] = (
                     'Canonical artifact body validation. For domain, design, component and interface artifacts, '

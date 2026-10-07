@@ -36,7 +36,7 @@ _ARTIFACT_ROLES = {
     DOMAIN_ROLE: {"domain"},
 }
 _REQUEST_KEYS = {
-    "node_ref", "selector", "roles", "subject", "binding",
+    "node_ref", "selector", "roles", "subject", "binding", "role_bindings",
     "required_coverage", "semantic_context_digest",
 }
 _NODE_RESULT_KEYS = {
@@ -405,7 +405,8 @@ def _read_plan(control: Any, actor: Any, project: str,
 
 
 def _task_semantic(control: Any, actor: Any, project: str, task_row: dict[str, Any],
-                   *, prompt_context: dict[str, Any] | None = None) -> tuple[dict[str, Any], str | None, str | None, list[str]]:
+                   *, prompt_context: dict[str, Any] | None = None,
+                   review_role: str | None = None) -> tuple[dict[str, Any], str | None, str | None, list[str]]:
     body = parse_json(task_row["body"])
     if type(body) is not dict:
         raise Fault("integrity_error", "Task definition body is not an object", task_row.get("id"))
@@ -428,14 +429,43 @@ def _task_semantic(control: Any, actor: Any, project: str, task_row: dict[str, A
     semantic = {"task": _json_copy(task_view, "task review material"),
                 "read_artifacts": artifact_values,
                 "test_plan": _json_copy(plan_body, "test plan") if plan_body is not None else None}
+    plan_review_material = None
+    if plan_body is not None and review_role == "test_plan":
+        materials = getattr(control.g, "review_materials", None)
+        if materials is None:
+            raise Fault("unverified_node_review", "Current test-plan review material is unavailable")
+        snapshot_override = None
+        if prompt_context is not None:
+            baseline = prompt_context.get("review_snapshot")
+            if (type(baseline) is not dict or type(baseline.get("digest")) is not str or
+                    type(baseline.get("format")) is not str):
+                raise Fault("unverified_node_review", "Prompt test-plan baseline identity is missing")
+            snapshot_override = {"format": baseline["format"], "repos": {},
+                                 "digest": baseline["digest"]}
+        else:
+            plan_row = control.s.one("SELECT * FROM plans WHERE task=?", (task_row["id"],))
+            snapshot_override = materials.frozen_plan_snapshot(actor, task_row, plan_row)
+            need(snapshot_override is not None, "unverified_node_review",
+                 "Current frozen test-plan baseline is unavailable or stale")
+        frozen = materials.test_plan(actor, task_row, plan_body,
+                                     store_snapshot_blobs=False,
+                                     snapshot_override=snapshot_override)
+        plan_review_material = frozen
+        for key in ("review_policy", "review_snapshot", "task_reads", "dependencies"):
+            semantic[key] = frozen["context"][key]
     if prompt_context is not None:
-        if set(prompt_context) - {"task", "read_artifacts", "test_plan", "managed_execution", "read_access", "candidate", "test_evidence"}:
+        if set(prompt_context) - {"task", "read_artifacts", "test_plan", "managed_execution", "read_access", "candidate", "test_evidence",
+                                  "review_policy", "review_snapshot", "task_reads", "dependencies"}:
             raise Fault("unverified_node_review", "Prompt task context has unknown semantic fields")
         prompted_task = prompt_context.get("task")
         prompted_plan = prompt_context.get("test_plan")
         prompted_reads = prompt_context.get("read_artifacts")
         if prompted_task != semantic["task"] or prompted_plan != semantic["test_plan"]:
             raise Fault("stale_node_review", "Prompt Task or test plan material differs")
+        if plan_review_material is not None:
+            for key in ("review_policy", "review_snapshot", "task_reads", "dependencies"):
+                if prompt_context.get(key) != plan_review_material["context"][key]:
+                    raise Fault("stale_node_review", "Prompt test-plan review material differs", key)
         if type(prompted_reads) is not list or len(prompted_reads) != len(artifact_values):
             raise Fault("unverified_node_review", "Prompt Task read artifact coverage is incomplete")
         prompted_values = []
@@ -548,6 +578,11 @@ def _node_snapshot(control: Any, actor: Any, project: str,
             raise Fault("integrity_error", "Artifact acceptance coverage is malformed", artifact["id"])
         request = {"node_ref": ref, "selector": selector, "roles": roles,
                    "subject": artifact["id"], "binding": artifact["digest"],
+                   "role_bindings": {
+                       review_role: (artifact["digest"] if review_role == DOMAIN_ROLE else
+                                     control.g.review_materials.artifact(actor, artifact["id"], review_role)["binding"])
+                       for review_role in roles
+                   },
                    "required_coverage": _json_copy(coverage, "artifact coverage"),
                    "semantic_context_digest": _sha_digest(semantic)}
         return {"request": request, "semantic": semantic, "kind": "domain" if role == DOMAIN_ROLE else "artifact",
@@ -562,15 +597,28 @@ def _node_snapshot(control: Any, actor: Any, project: str,
     actual_definition = task_definition_digest(body)
     if row["revision"] != ref["revision"] or actual_definition != ref["definition_digest"]:
         raise Fault("stale_reference", "Task revision is not current", ref["task"])
-    semantic, plan_ref, plan_reason, coverage = _task_semantic(control, actor, project, row)
+    semantic, plan_ref, plan_reason, coverage = _task_semantic(
+        control, actor, project, row, review_role="test_plan")
     if semantic["test_plan"] is None:
         binding = digest({})
     else:
         binding = digest(semantic["test_plan"])
+    role_bindings = {}
+    for review_role in roles:
+        if review_role == "test_plan" and semantic["test_plan"] is not None:
+            baseline = semantic["review_snapshot"]
+            role_bindings[review_role] = control.g.review_materials.test_plan(
+                actor, row, semantic["test_plan"], store_snapshot_blobs=False,
+                snapshot_override={"format": baseline["format"], "repos": {},
+                                  "digest": baseline["digest"]},
+            )["binding"]
+        else:
+            role_bindings[review_role] = control.g.task_binding(row["id"])
     if contract == NODE_V2:
         semantic = {"node_contract":NODE_V2, "material":semantic}
     request = {"node_ref": ref, "selector": selector, "roles": roles,
                "subject": row["id"], "binding": binding,
+               "role_bindings": role_bindings,
                "required_coverage": _json_copy(coverage, "Task coverage"),
                "semantic_context_digest": _sha_digest(semantic)}
     return {"request": request, "semantic": semantic, "kind": "task_plan", "contract":contract,
@@ -672,17 +720,19 @@ def _receipt_candidates(control: Any, request: dict[str, Any], role: str) -> tup
     # Governance supplies the candidate family and current binding. The shared
     # reader validates receipt/run identity and chooses the latest observation
     # by the durable run_observed event sequence, never by created telemetry.
-    ids = control.g.evidence_for(request["subject"], request["binding"], role)
+    binding = request.get("role_bindings", {}).get(role, request["binding"])
+    ids = control.g.evidence_for(request["subject"], binding, role)
     if not ids:
         return [], None
     ordered = ordered_observed_receipts(
         control, project=request["node_ref"]["project"], subject=request["subject"],
-        role=role, binding=request["binding"],
+        role=role, binding=binding,
         receipt_ids=[item["id"] if isinstance(item, dict) else item for item in ids],
     )
     if not ordered:
         return [], None
-    latest = ordered[-1]
+    usable = [item for item in ordered if control.g._usable_review_judgment(item["body"])]
+    latest = (usable or ordered)[-1]
     return [latest["row"]["id"]], latest["event_seq"]
 
 
@@ -710,7 +760,8 @@ def _review_one(control: Any, actor: Any, request: dict[str, Any], info: dict[st
         # Existing Governance remains authoritative for signatures, result,
         # readonly state, qualification and task test-evidence currentness.
         try:
-            qualified = control.g.require_review(ident, request["subject"], request["binding"], {role})
+            binding = request.get("role_bindings", {}).get(role, request["binding"])
+            qualified = control.g.require_review(ident, request["subject"], binding, {role}, latest=True)
         except Fault as exc:
             if receipt.get("result", {}).get("verdict") != "pass" or receipt.get("failure") or receipt.get("exit_code") != 0:
                 return _status_result(request, status="failed", reason=exc.code,
@@ -759,7 +810,17 @@ def _review_one(control: Any, actor: Any, request: dict[str, Any], info: dict[st
             task_row = control.s.one("SELECT * FROM tasks WHERE id=?", (request["subject"],))
             prompted_semantic, _, _, _ = _task_semantic(
                 control, actor, request["node_ref"]["project"], task_row,
-                prompt_context=role_context)
+                prompt_context=role_context, review_role=role)
+            if role != "test_plan":
+                # Supplemental Task roles use Runtime's ordinary Task review
+                # projection. The plan selector's additional snapshot, policy,
+                # read-pin and dependency fields belong only to test_plan
+                # receipts; _task_semantic has already checked this role's
+                # exact Task/plan/reads prompt, while Governance checked its
+                # current test-evidence selection and task binding.
+                return _status_result(request, status="satisfied",
+                                      reason="supplemental_task_review_accepted",
+                                      receipt=qualified)
         if info.get("contract") == NODE_V2 and info["kind"] != "domain":
             prompted_semantic = {"node_contract":NODE_V2, "material":prompted_semantic}
         prompted_digest = _sha_digest(prompted_semantic)

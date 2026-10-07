@@ -117,4 +117,28 @@ class Client:
             result=receive(sock)
         if not result.get('ok'):
             e=result.get('error',{});raise Fault(e.get('code','rpc_error'),e.get('message','Request rejected'),e.get('details'))
-        return result['result']
+        value=result['result']
+        if isinstance(value,dict) and value.get('format')=='daikibo.rpc-result-reference.v1':
+            import base64
+            from .common import digest
+            need(value.get('read_operation')=='request.result' and value.get('request_id')==request['request']['id'],
+                 'invalid_result_reference','Unexpected saved-result reference')
+            total=value.get('bytes')
+            need(type(total) is int and total>0,'invalid_result_reference','Invalid saved-result size')
+            chunks=[];offset=0
+            while offset<total:
+                page=self.call('request.result',{'request_id':value['request_id'],
+                               'expected_digest':value['sha256'],'offset':offset})
+                need(page.get('sha256')==value['sha256'] and page.get('bytes')==total and page.get('offset')==offset,
+                     'stale_result','Saved-result page identity differs')
+                try:chunk=base64.b64decode(page['base64'],validate=True)
+                except (ValueError,TypeError,KeyError) as exc:raise Fault('invalid_result_page','Malformed result bytes') from exc
+                end=offset+len(chunk)
+                need(chunk and len(chunk)<=65536 and end<=total and page.get('end')==end and
+                     page.get('next_offset')==(end if end<total else None),
+                     'invalid_result_page','Incomplete or overlapping result page')
+                chunks.append(chunk);offset=end
+            data=b''.join(chunks)
+            need(digest(data)==value['sha256'],'integrity_error','Saved result digest differs')
+            return parse_json(data,limit=len(data))
+        return value
