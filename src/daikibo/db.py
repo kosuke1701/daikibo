@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from .common import Fault, need, digest, canonical, atomic_write
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 def _execute_sql_script(connection: sqlite3.Connection, script: str) -> None:
@@ -80,11 +80,12 @@ class Store:
             try:self.conn.backup(target)
             finally:target.close()
             os.chmod(previous,0o600)
-            need(self.conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='program_origins'"
-            ).fetchone() is None,
-                 "origin_schema_invalid",
-                 "Schema 16 program-origin metadata exists before migration")
+            if version < 16:
+                need(self.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='program_origins'"
+                ).fetchone() is None,
+                     "origin_schema_invalid",
+                     "Schema 16 program-origin metadata exists before schema 16")
             migrations={
                 2:"CREATE TABLE IF NOT EXISTS documents(id TEXT PRIMARY KEY,project TEXT NOT NULL REFERENCES projects(id),body TEXT NOT NULL CHECK(json_valid(body)),status TEXT NOT NULL,created REAL NOT NULL);",
                 3:"CREATE TABLE IF NOT EXISTS review_scopes(id TEXT PRIMARY KEY,program TEXT NOT NULL REFERENCES programs(id),project TEXT NOT NULL REFERENCES projects(id),phase TEXT NOT NULL,body TEXT NOT NULL CHECK(json_valid(body)),digest TEXT NOT NULL,status TEXT NOT NULL,created REAL NOT NULL); CREATE INDEX IF NOT EXISTS review_scopes_program ON review_scopes(program,phase,status);"
@@ -141,11 +142,25 @@ CREATE TRIGGER IF NOT EXISTS program_origins_no_update BEFORE UPDATE ON program_
 CREATE TRIGGER IF NOT EXISTS program_origins_no_delete BEFORE DELETE ON program_origins
  BEGIN SELECT RAISE(ABORT,'retain program origin history'); END;
 """
+            migrations[17] = """
+CREATE TABLE IF NOT EXISTS decision_batches (
+ id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(id),
+ body TEXT NOT NULL CHECK(json_valid(body)), digest TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('prepared','applied')),
+ result TEXT CHECK(result IS NULL OR json_valid(result)), created REAL NOT NULL, applied REAL
+);
+CREATE INDEX IF NOT EXISTS decision_batches_project ON decision_batches(project,created,id);
+CREATE TRIGGER IF NOT EXISTS decision_batches_immutable BEFORE UPDATE OF project,body,digest,created ON decision_batches
+ BEGIN SELECT RAISE(ABORT,'immutable decision batch packet'); END;
+CREATE TRIGGER IF NOT EXISTS decision_batches_no_delete BEFORE DELETE ON decision_batches
+ BEGIN SELECT RAISE(ABORT,'retain decision batch history'); END;
+"""
             script=''.join(migrations[v] for v in range(version+1,SCHEMA_VERSION+1))
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 _execute_sql_script(self.conn, script)
-                _backfill_program_origins(self.conn)
+                if version < 16:
+                    _backfill_program_origins(self.conn)
                 self.conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
                 self.conn.execute("COMMIT")
             except BaseException:

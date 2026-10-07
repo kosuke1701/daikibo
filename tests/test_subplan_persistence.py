@@ -47,7 +47,7 @@ def test_migrate_actual_schema10_shape_without_fabricated_history(setup):
     other=Control(home,'validation',start_workers=False)
     try:
         owner=other.sec.authenticate(None)
-        assert other.s.one('PRAGMA user_version')['user_version']==SCHEMA_VERSION==16
+        assert other.s.one('PRAGMA user_version')['user_version']==SCHEMA_VERSION==17
         assert (home/'pre-migration-v10.sqlite3').is_file()
         assert other.k.artifact(owner,q)==before
         assert other.subplans.list(owner,setup[4])['total']==0

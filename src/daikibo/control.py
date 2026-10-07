@@ -26,6 +26,7 @@ class Control:
         self.s=Store(home);self.sec=Security(self.s);self.sec.bootstrap()
         self.k=Knowledge(self.s,self.sec);self.g=Governance(self.s,self.sec,self.k,mode);self.k.assessments=self.g
         self.w=Workflow(self.s,self.sec,self.k,self.g);self.p=Planning(self.s,self.sec,self.k,self.g,self.w)
+        self.w.planning=self.p
         # Unit4-R readonly admission must consume the complete composition
         # root.  Binding this identity early lets Governance/Workflow keep a
         # single evaluator, assurance, traceability, and local-execution
@@ -238,8 +239,13 @@ class Control:
           'trace.link':self.k.link,'trace.impact':self.k.impact,'trace.audit':self.k.trace,'baseline.create':self.k.baseline,'project.export':self.k.export,
           'repository.register':self.sn.register,'repository.list':self.repository_list,
           'program.begin':self.p.begin,'program.next':self.p.next,'program.advance':self.p.advance,
-          'change.propose':self.p.change,'change.attempt':self.p.attempt,'change.delta':self.p.set_delta,'change.apply':self.p.apply_technical_change,'change.withdraw':self.p.withdraw,
+          'change.propose':self.p.change,'change.get':self.p.change_get,'change.read':self.p.change_read,
+          'change.attempt':self.p.attempt,'change.delta':self.p.set_delta,'change.apply':self.p.apply_technical_change,'change.withdraw':self.p.withdraw,
           'conflict.report':self.p.conflict,'decision.propose':self.p.propose_decision,'decision.respond':self.p.respond,'decision.apply':self.p.apply_decision,
+          'decision.review_subject':self.p.decision_review_subject,
+          'decision.read':self.p.decision_read,
+          'decision.batch_prepare':self.p.decision_batch_prepare,'decision.batch_get':self.p.decision_batch_get,
+          'decision.batch_read':self.p.decision_batch_read,'decision.batch_apply':self.p.decision_batch_apply,
           'decision.get':self.decision_get,'decision.recent':self.i.recent_decisions,
           'task.create':self.w.create,'task.get':self.w.task,'task.list':self.task_list,'task.parallel_candidates':self.w.parallel_candidates,'task.plan_tests':self.w.plan_tests,'task.ready':self.w.ready,
           'task.claim':self.w.claim,'task.heartbeat':self.w.heartbeat,'task.complete':self.w.complete,'task.replan':self.w.replan,'task.cancel':self.w.cancel,
@@ -302,7 +308,7 @@ class Control:
           'assurance.withdraw_propose':self.assurance.withdraw_propose,
           'assurance.report':self.assurance.report,
         })
-        reads={'project.get','source.read','source.coverage','artifact.get','artifact.list','trace.impact','trace.audit','project.export','repository.list','program.next','decision.get','decision.recent','task.get','task.list','task.parallel_candidates','workflow.status','policy.get','adapter.list','run.get','evidence.get','context.fresh','code.search','code.consumers','code.read','code.inventory','delivery.get','delivery.profile_current','blob.read','api.describe',
+        reads={'project.get','source.read','source.coverage','artifact.get','artifact.list','trace.impact','trace.audit','project.export','repository.list','program.next','decision.get','decision.read','decision.review_subject','decision.batch_get','decision.batch_read','decision.recent','change.get','change.read','task.get','task.list','task.parallel_candidates','workflow.status','policy.get','adapter.list','run.get','evidence.get','context.fresh','code.search','code.consumers','code.read','code.inventory','delivery.get','delivery.profile_current','blob.read','api.describe',
                'traceability.get','traceability.list','traceability.items','traceability.read','traceability.diff','traceability.review_subject','traceability.coverage','traceability.closure_subject','traceability.history','traceability.inspect_archive',
                'assurance.catalog','assurance.contains','assurance.object_get','assurance.object_list','assurance.refs','assurance.history','assurance.resolve','assurance.resolve_pinned','assurance.evaluate_current','assurance.review_subject','assurance.report'}
         reads.update({'task.test_evidence'})

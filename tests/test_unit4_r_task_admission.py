@@ -719,7 +719,7 @@ def test_schema15_migration_runs_a_real_task_after_origin_backfill(tmp_path):
     control = Control(home, mode="validation", start_workers=False)
     try:
         control.owner = control.sec.authenticate(None)
-        assert control.s.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION == 16
+        assert control.s.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION == 17
         assert control.s.one("SELECT count(*) AS n FROM tasks")["n"] == 0
         project = control.s.one("SELECT id FROM projects", (), True)["id"]
         program = control.s.one("SELECT id FROM programs WHERE project=?", (project,), True)["id"]
@@ -865,7 +865,7 @@ def test_schema15_existing_task_and_canonical_root_survive_migration_and_admissi
     control = Control(home, mode="validation", start_workers=False)
     try:
         control.owner = control.sec.authenticate(None)
-        assert control.s.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION == 16
+        assert control.s.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION == 17
         after = snapshot(control.s.conn)
         assert after == before
         origin = resolve_program_origin(

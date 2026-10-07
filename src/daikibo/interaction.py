@@ -60,9 +60,14 @@ class Interaction:
         actor.require('owner');text(utterance,'acknowledgement',10000)
         with self.s.transaction():
             row=self.s.one('SELECT * FROM inbox WHERE id=?',(item,),True)
-            need(row['kind'] not in {'product_decision','conflict'},'adjudication_required','Use the bound decision response workflow, not a generic acknowledgement')
+            need(row['kind'] not in {'product_decision','provisional_decision','conflict'},
+                 'adjudication_required','Use the bound decision response workflow, not a generic acknowledgement')
             notice_digest=digest(row['body'].encode())
             need(expected_digest is None or expected_digest==notice_digest,'stale_notice','Notification content changed')
+            if row['status']=='acknowledged':
+                self._exact_acknowledgement_retry(row,utterance,source,notice_digest)
+                return {'id':item,'acknowledged':True,'exceptions_still_visible_in_status':True}
+            need(row['status']=='open','already_closed','This notification is already closed')
             was_new_source=source is None
             if was_new_source:
                 original=self.k.source(actor,row['project'],utterance,'inbox-ack:'+item)
@@ -72,10 +77,23 @@ class Interaction:
                 original=self.s.one('SELECT created FROM sources WHERE id=?',(source,),True)
             answer_version=self._notice_answer_after_publication(row,source,original['created'],was_new_source)
             if was_new_source:
-                quote={'source':original['id'],'start':0,'end':original['characters'],'quote':utterance}
+                quote={'source':original['id'],'source_digest':original['digest'],
+                       'start':0,'end':original['characters'],'quote':utterance}
             else:
                 quote=self.k.human_quote(actor,row['project'],source,utterance,after=answer_version['after'])
-            self.s.execute("UPDATE inbox SET status='acknowledged' WHERE id=?",(item,))
+            prior_ack=self.s.one("SELECT seq FROM events WHERE project=? AND kind='inbox_acknowledged' "
+                "AND json_extract(body,'$.id')=? AND json_extract(body,'$.notice_version_digest')=? "
+                "ORDER BY seq DESC LIMIT 1",(row['project'],item,self._notice_version_digest(row)))
+            if prior_ack:
+                registered_seq=answer_version['source_seq']
+                if registered_seq is None:
+                    registered=self.s.one("SELECT seq FROM events WHERE project=? AND kind='source_registered' "
+                        "AND json_extract(body,'$.source')=? ORDER BY seq DESC LIMIT 1",(row['project'],source))
+                    registered_seq=registered['seq'] if registered else None
+                need(registered_seq is not None and registered_seq>prior_ack['seq'],'stale_user_input',
+                     'A reissued notification needs a new acknowledgement source')
+            cursor=self.s.execute("UPDATE inbox SET status='acknowledged' WHERE id=? AND status='open'",(item,))
+            need(cursor.rowcount==1,'already_closed','This notification was closed while recording the acknowledgement')
             self.sec.event(row['project'],'inbox_acknowledged',actor.id,
                            {'id':item,'notice_digest':notice_digest,
                             'notice_version_digest':self._notice_version_digest(row),
@@ -83,6 +101,54 @@ class Interaction:
                             'source_registered_seq':answer_version['source_seq'],
                             **quote,'waiver_resolved':False})
         return {'id':item,'acknowledged':True,'exceptions_still_visible_in_status':True}
+
+    def _exact_acknowledgement_retry(self,row,utterance,source,notice_digest):
+        event=self.s.one("SELECT seq,body FROM events WHERE project=? AND kind='inbox_acknowledged' "
+                         "AND json_extract(body,'$.id')=? ORDER BY seq DESC LIMIT 1",
+                         (row['project'],row['id']))
+        need(event is not None,'already_closed',
+             'This notification was closed automatically and has no human acknowledgement to replay')
+        answer=parse_json(event['body'])
+        version_digest=self._notice_version_digest(row)
+        need(answer.get('notice_digest')==notice_digest and answer.get('notice_version_digest')==version_digest,
+             'already_closed','The human acknowledgement belongs to an older notification version')
+        published=self.s.one("SELECT seq FROM events WHERE project=? AND kind='notification_published' "
+            "AND json_extract(body,'$.item')=? ORDER BY seq DESC LIMIT 1",(row['project'],row['id']))
+        published_seq=published['seq'] if published else None
+        need(answer.get('notification_published_seq')==published_seq,
+             'already_closed','The notification was reissued after this acknowledgement')
+        later_close=self.s.one("SELECT seq FROM events WHERE project=? AND kind='notification_closed' "
+            "AND json_extract(body,'$.item')=? AND seq>? ORDER BY seq DESC LIMIT 1",
+            (row['project'],row['id'],event['seq']))
+        need(later_close is None,'already_closed',
+             'The notification was automatically closed after this human acknowledgement')
+        source_id=answer.get('source')
+        need(isinstance(source_id,str),'already_closed','The acknowledgement has no retained human source')
+        source_row=self.s.one('SELECT project,trust,blob,locator,characters FROM sources WHERE id=?',(source_id,))
+        need(source_row is not None and source_row['project']==row['project'] and source_row['trust']=='human' and
+             answer.get('source_digest',source_row['blob'])==source_row['blob'],
+             'already_closed','The acknowledgement source is no longer the exact trusted source')
+        registered=self.s.one("SELECT seq FROM events WHERE project=? AND kind='source_registered' "
+            "AND json_extract(body,'$.source')=? AND json_extract(body,'$.digest')=? ORDER BY seq DESC LIMIT 1",
+            (row['project'],source_id,source_row['blob']))
+        recorded_source_seq=answer.get('source_registered_seq')
+        need(registered is not None and registered['seq']<event['seq'] and
+             (recorded_source_seq is None or recorded_source_seq==registered['seq']) and
+             (published_seq is None or registered['seq']>published_seq),
+             'already_closed','The acknowledgement source is not current for this notification')
+        content=self.s.blob_get(source_row['blob']).decode('utf-8')
+        start,end,quoted=answer.get('start'),answer.get('end'),answer.get('quote')
+        need(type(start) is int and type(end) is int and isinstance(quoted,str) and
+             0<=start<end<=len(content) and content[start:end]==quoted,
+             'already_closed','The acknowledgement quotation does not match its source')
+        if source is None:
+            same_request=(source_row['locator']=='inbox-ack:'+row['id'] and utterance==quoted and
+                          start==0 and end==len(content) and content==quoted)
+        else:
+            same_request=(source==source_id and utterance==quoted and
+                          content.find(utterance)==start and end==start+len(utterance))
+        need(same_request,'already_closed',
+             'This notification is closed; only its exact human acknowledgement can be replayed')
 
     def waiver_close(self,actor,waiver):
         row=self.s.one('SELECT * FROM waivers WHERE id=?',(waiver,),True)

@@ -57,7 +57,7 @@ class Jobs:
             # execution.
             row=self.s.one("SELECT project FROM assurance_objects WHERE id=? AND kind='packet'",(subject,))
             if row:return row['project']
-            for table in ('tasks','artifacts','changes','decisions','programs','deliveries','review_scopes','breakdown_packets','subplan_packets','task_revision_proposals','workstreams','local_execution_proposals','execution_control_proposals','traceability_records'):
+            for table in ('tasks','artifacts','changes','decisions','decision_batches','programs','deliveries','review_scopes','breakdown_packets','subplan_packets','task_revision_proposals','workstreams','local_execution_proposals','execution_control_proposals','traceability_records'):
                 row=self.s.one(f'SELECT project FROM {table} WHERE id=?',(subject,))
                 if row:return row['project']
             raise Fault('not_found','Review subject does not exist')

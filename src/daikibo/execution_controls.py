@@ -369,7 +369,7 @@ class ExecutionControls:
                 {"source": body["source"], "requirement": body["requirement"], "expected_policy": {"revision": old["revision"], "digest": old["digest"]},
                  "supersedes": [{"id": v["id"], "digest": v["digest"]} for v in body.get("supersedes", [])], "reason": body["reason"]})
             binding = self.policy_binding(proposal)
-            self.g.require_review(review_receipt, proposal, binding, {"consistency"})
+            self.g.require_review(review_receipt, proposal, binding, {"consistency"}, latest=True)
             review = self.g.receipt(review_receipt)
             covered = set(review["result"].get("covered", []))
             required = {f"policy:{proposal}", f"source:{source['id']}", f"requirement:{requirement['id']}"} | {f"supersede:{v['id']}" for v in body.get("supersedes", [])}

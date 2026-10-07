@@ -146,31 +146,93 @@ class Native:
         return {'actions': results, 'all_applied': len(results)==len(actions) and not any('error' in x for x in results)}
 
     def present_decision(self, actor, session, decision):
-        row = self._session(session); value = self.c.decision_get(actor, decision)
-        need(value['project'] == row['project'], 'cross_project', 'Decision belongs to another project')
         with self.s.transaction():
-            row['body'].setdefault('presented', {})[decision] = {'digest': value['digest'], 'at': timestamp()}
+            row = self._session(session); value = self.c.decision_get(actor, decision)
+            need(value['project'] == row['project'], 'cross_project', 'Decision belongs to another project')
+            expiry = self.c.p._expire_due_decision(row['project'], decision, actor=actor.id)
+            if expiry and expiry.get('expired'):
+                return expiry
+            value = self.c.decision_get(actor, decision)
+            need(value['status'] in {'pending','provisional','deferred','decision_received'},'stale_decision',
+                 'Only a decision awaiting or receiving a response can be presented')
+            event=self.c.sec.event(row['project'],'native_decision_presented',actor.id,
+                {'session':session,'decision':decision,'digest':value['digest']})
+            seq=self.s.one('SELECT seq FROM events WHERE id=?',(event,),True)['seq']
+            row['body'].setdefault('presented', {})[decision] = {'digest': value['digest'], 'at': timestamp(),
+                'seq':seq,'consumed':False}
             self._save(row)
-        return {'decision': decision, 'expected_digest': value['digest'], 'proposal': value['body'],
+        return {'decision': decision, 'expected_digest': value['digest'], 'presentation_seq':seq,'proposal': value['body'],
                 'instruction': 'Ask the user now; record the subsequent answer with native.input. Do not interpret displaying this proposal as approval.'}
 
     def _quote(self, row, source, quote, after=0):
         text(quote, 'exact user quotation', 100000)
         turn = self.s.one('SELECT * FROM native_turns WHERE session=? AND source=?', (row['id'], source), True)
-        if after is not None:
+        if isinstance(after,dict) and type(after.get('seq')) is int:
+            observed=self.s.one("SELECT seq FROM events WHERE project=? AND kind='native_user_input_recorded' "
+                                "AND json_extract(body,'$.session')=? AND json_extract(body,'$.source')=? ORDER BY seq DESC LIMIT 1",
+                                (row['project'],row['id'],source))
+            need(observed and observed['seq']>after['seq'],'stale_user_input',
+                 'The answer was recorded before this proposal presentation')
+        elif after is not None:
             need(turn['created'] > after, 'stale_user_input', 'The answer predates the proposal shown to the user')
         original = self.s.one('SELECT blob FROM sources WHERE id=?', (source,), True)
         need(quote in self.s.blob_get(original['blob']).decode(), 'quote_mismatch', 'Quote must appear verbatim in the recorded user input')
         return turn
 
     def respond(self, actor, session, decision, expected_digest, source, choice, quote):
-        row = self._session(session); shown = row['body'].get('presented', {}).get(decision)
-        need(shown and shown['digest']==expected_digest, 'proposal_not_presented', 'Present this exact proposal before recording its answer')
         with self.s.transaction():
-            decision_row=self.s.one('SELECT project FROM decisions WHERE id=?',(decision,),True)
+            row = self._session(session); shown = row['body'].get('presented', {}).get(decision)
+            need(shown and shown['digest']==expected_digest, 'proposal_not_presented', 'Present this exact proposal before recording its answer')
+            decision_row=self.s.one('SELECT * FROM decisions WHERE id=?',(decision,),True)
             need(decision_row['project']==row['project'],'cross_project','Decision belongs elsewhere')
-            self._quote(row, source, quote, shown['at'])
+            expiry=self.c.p._expire_due_decision(row['project'],decision,actor=actor.id)
+            if expiry and expiry.get('expired'):
+                return expiry
+            decision_row=self.s.one('SELECT * FROM decisions WHERE id=?',(decision,),True)
+            self._quote(row, source, quote, shown if type(shown.get('seq')) is int else shown.get('at'))
+
+            # A reported answer is single-use for changing the decision. It
+            # can, however, be corrected when the same current answer used a
+            # retained source and the user wants to bind a more precise quote
+            # from that exact source. The immutable response event must prove
+            # that the proposal, choice and source are still the current ones.
+            # A newly displayed answer still requires a source recorded after
+            # that presentation, and a different choice never reuses evidence.
+            evidence=self.c.p.response_evidence(decision)
+            prior=evidence['body'] if evidence else {}
+            source_row=self.s.one('SELECT project,trust,blob FROM sources WHERE id=?',(source,),True)
+            content=self.s.blob_get(source_row['blob']).decode()
+            start=content.find(quote)
+            prior_quote=prior.get('quote')
+            prior_start=prior.get('start')
+            prior_end=prior.get('end')
+            prior_range_valid=(isinstance(prior_quote,str) and type(prior_start) is int and
+                type(prior_end) is int and 0<=prior_start<=prior_end<=len(content) and
+                prior_end==prior_start+len(prior_quote) and content[prior_start:prior_end]==prior_quote)
+            current_answer=(decision_row['status']=='decision_received' and
+                decision_row['digest']==expected_digest and prior.get('digest')==expected_digest and
+                prior.get('choice')==decision_row['response'] and prior.get('source')==decision_row['source'] and
+                prior.get('source_digest')==source_row['blob'] and
+                source_row['project']==row['project'] and source_row['trust']=='human' and
+                prior_range_valid)
+            reusing_current_source=(current_answer and decision_row['source']==source)
+            if shown.get('consumed',False) or reusing_current_source:
+                same_answer=(reusing_current_source and decision_row['response']==choice and start>=0)
+                need(same_answer,'stale_user_input',
+                     'This presentation already recorded an answer; use a fresh observation to change it')
+                if prior_quote==quote and prior_start==start and prior_end==start+len(quote):
+                    self.c.p._validate_response_current(Actor('reported-user:' + session, 'owner'),
+                                                        decision_row, parse_json(decision_row['body']))
+                    shown['consumed']=True
+                    row['body'].setdefault('presented',{})[decision]=shown
+                    self._save(row)
+                    return {'id':decision,'status':'decision_received','consistency_recheck_required':True}
             result = self.c.p.respond(Actor('reported-user:' + session, 'owner'), decision, expected_digest, choice, quote, source=source)
+            if result.get('expired') or result.get('answered') is False:
+                return result
+            shown['consumed']=True
+            row['body'].setdefault('presented',{})[decision]=shown
+            self._save(row)
             self.c.sec.event(row['project'], 'native_decision_response', actor.id,
                              {'session': session, 'decision': decision, 'input_source': source, 'quote': quote,
                               'proposal_digest': expected_digest, 'identity_authenticated': False})

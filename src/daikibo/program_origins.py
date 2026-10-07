@@ -7,6 +7,10 @@ from .common import Fault, canonical, digest, need, parse_json
 
 FORMAT = "daikibo.program-origin.v1"
 SCHEMA = 16
+# The origin table was introduced in v16 and is unchanged by the additive v17
+# decision-batch table. Accept both explicit layouts, but never infer support
+# from `>= 16`: a future schema must be reviewed here before it emits origins.
+SUPPORTED_SCHEMA_VERSIONS = {16, 17}
 POLICIES = {"legacy-preserved", "e3-required"}
 ORIGINS = {"schema-migration", "program.begin"}
 BODY_KEYS = {
@@ -37,8 +41,8 @@ def _connection_rows(connection: Any, sql: str, args: tuple[Any, ...] = ()) -> l
 def require_origin_schema(connection: Any) -> None:
     """Require the current schema's complete origin table before new output."""
     version = _connection_row(connection, "PRAGMA user_version")
-    need(version is not None and version.get("user_version") == SCHEMA,
-         "origin_schema_invalid", "Program-origin output requires schema 16", version)
+    need(version is not None and version.get("user_version") in SUPPORTED_SCHEMA_VERSIONS,
+         "origin_schema_invalid", "Program-origin output requires a supported schema 16 or 17", version)
     table = _connection_row(
         connection,
         "SELECT name FROM sqlite_master WHERE type='table' AND name='program_origins'",

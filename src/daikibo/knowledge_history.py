@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import os
 import tempfile
 import zipfile
@@ -249,6 +250,60 @@ def _validate_specifications(spec, *, include_projection=False):
         spec['revisions'], spec['artifacts'],
         lambda source: need(source in sources,'invalid_snapshot','Referenced source is missing from the archive'),
         error_code='invalid_snapshot')
+
+    def validate_delta_snapshot(proof,subject,subject_kind,base_material):
+        need(isinstance(proof,dict) and proof.get('format')=='decision-incremental-proof.v1' and
+             proof.get('subject')==subject and proof.get('subject_kind')==subject_kind and
+             isinstance(proof.get('base_review_receipt'),str) and proof['base_review_receipt'] and
+             isinstance(proof.get('base_run'),str) and proof['base_run'] and
+             isinstance(proof.get('base_input_digest'),str) and len(proof['base_input_digest'])==64 and
+             type(proof.get('base_run_observed_seq')) is int and proof['base_run_observed_seq']>0 and
+             proof.get('base_material_digest')==digest(base_material) and
+             proof.get('base_binding')==digest(base_material),
+             'invalid_snapshot','Incremental review base proof is malformed')
+        addition=proof.get('added_artifact')
+        need(isinstance(addition,dict) and addition.get('kind')=='requirement' and
+             addition.get('status')=='accepted' and type(addition.get('revision')) is int and
+             isinstance(addition.get('body'),dict) and digest(addition['body'])==addition.get('digest') and
+             set(addition['body'])<= {'title','statement','acceptance','source_refs','constraints','critical'} and
+             bool(addition['body'].get('source_refs')) and not addition['body'].get('constraints') and
+             not addition['body'].get('critical'),
+             'invalid_snapshot','Incremental review addition is malformed')
+        archived_artifact=artifacts.get(addition['id'])
+        archived_revision=revisions.get((addition['id'],addition['revision']))
+        need(archived_artifact is not None and archived_artifact.get('project')==spec['project'] and
+             archived_artifact.get('kind')=='requirement' and archived_revision is not None and
+             archived_revision.get('digest')==addition['digest'] and
+             canonical(archived_revision.get('body'))==canonical(addition['body']),
+             'invalid_snapshot','Incremental review addition is absent from accepted artifact history')
+        source_rows=proof.get('sources')
+        need(isinstance(source_rows,list) and source_rows and
+             all(isinstance(source,dict) for source in source_rows) and
+             [source.get('id') for source in source_rows]==addition['body']['source_refs'],
+             'invalid_snapshot','Incremental review source set differs from the added requirement')
+        for source in source_rows:
+            ident=source.get('id') if isinstance(source,dict) else None
+            archived=sources.get(ident)
+            need(archived is not None and source.get('project')==spec['project'] and
+                 source.get('trust')=='human' and archived.get('trust')=='human' and
+                 source.get('blob')==archived.get('blob') and
+                 source.get('locator')==archived.get('locator') and
+                 source.get('characters')==archived.get('characters') and
+                 isinstance(source.get('content'),str) and
+                 source['content']==spec['source_contents'].get(ident) and
+                 digest(source['content'].encode())==source['blob'],
+                 'invalid_snapshot','Incremental review source snapshot differs from archived human input')
+        links=proof.get('trace_links')
+        need(isinstance(links,list) and proof.get('trace_links_digest')==digest(links) and
+             all(isinstance(link,dict) and {'source','target','relation','confidence','basis'}<=set(link)
+                 for link in links) and
+             not any(link['source']==addition['id'] or link['target']==addition['id'] for link in links),
+             'invalid_snapshot','Incremental review trace-link snapshot is malformed')
+        need(isinstance(proof.get('current_material_digest'),str) and
+             len(proof['current_material_digest'])==64,
+             'invalid_snapshot','Incremental review current material digest is malformed')
+        return addition
+
     ranges={}
     for row in spec['dispositions']:
         need(row['source'] in sources,'invalid_snapshot','Disposition has no source')
@@ -276,6 +331,201 @@ def _validate_specifications(spec, *, include_projection=False):
     for decision in spec['decisions']:
         need(digest(decision['body'])==decision['digest'],'invalid_snapshot','Decision body digest differs')
         need(not decision.get('source') or decision['source'] in sources,'invalid_snapshot','Decision has no recorded source')
+    decision_batches=spec.get('decision_batches',[])
+    need(isinstance(decision_batches,list),'invalid_snapshot','Decision batch history is malformed')
+    decision_batch_ids=set()
+    for batch in decision_batches:
+        need(isinstance(batch,dict) and isinstance(batch.get('id'),str) and
+             batch['id'] not in decision_batch_ids and batch.get('project')==spec['project'],
+             'invalid_snapshot','Duplicate or cross-project decision batch')
+        decision_batch_ids.add(batch['id'])
+        need(batch.get('status') in {'prepared','applied'} and isinstance(batch.get('body'),dict) and
+             digest(batch['body'])==batch.get('digest') and batch['body'].get('id')==batch['id'] and
+             batch['body'].get('project')==spec['project'] and
+             batch['body'].get('format')=='decision-batch-review-material.v1',
+             'invalid_snapshot','Decision batch packet digest or identity differs')
+        members=batch['body'].get('members')
+        required=batch['body'].get('required_coverage')
+        packet_changes=batch['body'].get('changes')
+        need(isinstance(members,list) and 2<=len(members)<=20 and
+             all(isinstance(member,dict) for member in members) and
+             isinstance(required,list) and all(isinstance(marker,str) for marker in required) and
+             len(set(required))==len(required) and isinstance(packet_changes,dict),
+             'invalid_snapshot','Decision batch packet members or coverage are malformed')
+        member_ids=[]
+        expected_coverage=set()
+        member_change_ids=set()
+        for member in members:
+            decision_id=member.get('decision')
+            need(isinstance(decision_id,str),'invalid_snapshot','Decision batch member identity is malformed')
+            decision=registries['decisions'].get(decision_id)
+            need(decision is not None and decision['digest']==member.get('digest') and
+                 member.get('coverage')=='decision-member:'+decision_id and
+                 canonical(member.get('proposal'))==canonical(decision['body']) and
+                 member.get('status')=='decision_received' and isinstance(member.get('response'),str),
+                 'invalid_snapshot','Decision batch member has no exact recorded decision')
+            answer=member.get('answer_evidence')
+            answer_body=answer.get('body') if isinstance(answer,dict) else None
+            source_ref=member.get('source')
+            source_id=source_ref.get('id') if isinstance(source_ref,dict) else None
+            need(isinstance(source_id,str),'invalid_snapshot','Decision batch source identity is malformed')
+            source=sources.get(source_id)
+            source_text=spec['source_contents'].get(source_id)
+            need(isinstance(answer,dict) and isinstance(answer.get('id'),str) and bool(answer['id']) and
+                 type(answer.get('seq')) is int and answer['seq']>0 and
+                 isinstance(answer.get('actor'),str) and bool(answer['actor']) and
+                 isinstance(answer_body,dict) and source is not None and isinstance(source_text,str) and
+                 source_ref.get('trust')=='human' and source['trust']=='human' and
+                 source_ref.get('digest')==source['blob'] and answer_body.get('source')==source_ref.get('id') and
+                 source_ref.get('locator')==source['locator'] and source_ref.get('characters')==source['characters'] and
+                 answer_body.get('source_digest')==source['blob'] and
+                 answer_body.get('digest')==member['digest'] and answer_body.get('choice')==member['response'] and
+                 type(answer_body.get('start')) is int and type(answer_body.get('end')) is int and
+                 isinstance(answer_body.get('quote'),str) and
+                 0<=answer_body['start']<answer_body['end']<=len(source_text) and
+                 source_text[answer_body['start']:answer_body['end']]==answer_body['quote'],
+                 'invalid_snapshot','Decision batch answer quote does not match its exact trusted archived source')
+            selected_effect=member.get('selected_effect')
+            if 'selected_effect' in member:
+                need(selected_effect in {'accept','keep_existing','record_only'},
+                     'invalid_snapshot','Decision batch selected effect is malformed')
+            proposal=member.get('proposal')
+            need(isinstance(proposal,dict) and isinstance(
+                 proposal.get('options',['approve','reject','defer']),list),
+                 'invalid_snapshot','Decision batch proposal or options are malformed')
+            choice_effects=proposal.get('choice_effects',{})
+            has_effects=(any(proposal.get(key) for key in ('change','conflict','supersedes')) or
+                         proposal.get('type')=='policy')
+            need(isinstance(choice_effects,dict) and
+                 all(isinstance(choice,str) and isinstance(effect,str) and
+                     choice in proposal.get('options',['approve','reject','defer']) and
+                     choice not in {'approve','keep_existing','reject','defer'} and
+                     effect in {'accept','keep_existing','record_only'} and
+                     not (has_effects and effect=='record_only')
+                     for choice,effect in choice_effects.items()),
+                 'invalid_snapshot','Decision batch proposal choice effects are malformed')
+            if member['response']=='reject':expected_effect='reject'
+            elif member['response']=='defer':expected_effect='defer'
+            elif member['response'] in choice_effects:expected_effect=choice_effects[member['response']]
+            elif member['response']=='approve':expected_effect='accept'
+            elif member['response']=='keep_existing':expected_effect='keep_existing'
+            elif has_effects:
+                expected_effect=None
+            else:expected_effect='record_only'
+            need(selected_effect==expected_effect and answer_body.get('selected_effect')==selected_effect,
+                 'invalid_snapshot','Decision batch selected effect differs from its exact answer and proposal')
+            member_coverage=member.get('required_coverage',[])
+            need(isinstance(member_coverage,list) and all(isinstance(marker,str) for marker in member_coverage) and
+                 len(set(member_coverage))==len(member_coverage),
+                 'invalid_snapshot','Decision batch member coverage is malformed')
+            expected_coverage.update(member_coverage)
+            member_ids.append(decision_id)
+            expected_coverage.add('decision-member:'+decision_id)
+            proposal=member['proposal']
+            need(isinstance(proposal,dict),'invalid_snapshot','Decision batch proposal is malformed')
+            if proposal.get('change'):
+                change_id=proposal['change']
+                need(isinstance(change_id,str),'invalid_snapshot','Decision batch change identity is malformed')
+                member_change_ids.add(change_id)
+                change=packet_changes.get(change_id)
+                change_material=change.get('material') if isinstance(change,dict) else None
+                change_coverage=change_material.get('required_coverage',[]) if isinstance(change_material,dict) else None
+                change_body=change_material.get('body') if isinstance(change_material,dict) else None
+                need(isinstance(change_material,dict) and change_material.get('format')=='change-review-material.v1' and
+                     isinstance(change_body,dict) and isinstance(change_body.get('deltas',[]),list) and
+                     isinstance(change_coverage,list) and all(isinstance(marker,str) for marker in change_coverage) and
+                     canonical(member.get('change_material'))==canonical(change_material) and
+                     digest(change_material)==change.get('binding'),
+                     'invalid_snapshot','Decision batch change material differs from its member binding')
+                expected_coverage.update(change_coverage)
+        need(set(packet_changes)==member_change_ids,
+             'invalid_snapshot','Decision batch shared change set differs from its members')
+        need(expected_coverage<=set(required),
+             'invalid_snapshot','Decision batch member coverage is incomplete')
+        result=batch.get('result')
+        if batch['status']=='prepared':
+            need(result is None and batch.get('applied') is None,'invalid_snapshot',
+                 'Prepared decision batch has an applied result')
+        else:
+            need(isinstance(result,dict) and result.get('id')==batch['id'] and
+                 result.get('status')=='applied' and result.get('batch_digest')==batch['digest'] and
+                 isinstance(result.get('review_receipt'),str) and result.get('review_receipt') and
+                 result.get('members')==member_ids and result.get('atomic') is True and
+                 batch.get('applied') is not None,
+                 'invalid_snapshot','Applied decision batch result is incomplete')
+            expected_artifacts=set()
+            applied_change_ids={member['proposal'].get('change') for member in members
+                if member.get('proposal',{}).get('change') and
+                   member.get('selected_effect','accept')=='accept'}
+            for change_id in applied_change_ids:
+                change=packet_changes[change_id]
+                deltas=change['material']['body'].get('deltas',[])
+                need(isinstance(deltas,list) and all(isinstance(delta,dict) and isinstance(delta.get('artifact'),str)
+                     for delta in deltas),'invalid_snapshot','Applied decision batch has malformed artifact deltas')
+                expected_artifacts.update(delta['artifact'] for delta in deltas)
+            expected_artifacts=sorted(expected_artifacts)
+            need(result.get('changed_artifacts')==expected_artifacts,
+                 'invalid_snapshot','Applied decision batch changed-artifact result differs from its frozen members')
+            review_mode=result.get('review_mode','full')
+            need(review_mode in {'full','incremental'},'invalid_snapshot',
+                 'Applied decision batch review mode is malformed')
+            if review_mode=='incremental':
+                proof=result.get('incremental_proof')
+                need(isinstance(proof,dict) and
+                     result.get('base_review_receipt')==proof.get('base_review_receipt') and
+                     result.get('supplemental_review_receipt')==result.get('review_receipt') and
+                     proof.get('base_packet_digest')==batch['digest'],
+                     'invalid_snapshot','Applied incremental batch review references disagree')
+                addition=validate_delta_snapshot(proof,batch['id'],'decision_batch',batch['body'])
+                need(addition['id'] not in {item['id'] for item in batch['body']['baseline']['artifacts']} and
+                     addition['id'] not in {item['id'] for item in batch['body']['final']['artifacts']},
+                     'invalid_snapshot','Incremental batch requirement was already in its frozen packet')
+                member_bindings=proof.get('current_member_bindings')
+                need(isinstance(member_bindings,dict) and set(member_bindings)==set(member_ids) and
+                     all(isinstance(value,str) and len(value)==64 for value in member_bindings.values()),
+                     'invalid_snapshot','Incremental batch member bindings are malformed')
+                current_packet=copy.deepcopy(batch['body'])
+                projected={'id':addition['id'],'revision':addition['revision'],'digest':addition['digest'],
+                           'status':addition['status'],'body':addition['body']}
+                for field in ('baseline','final'):
+                    current_packet[field]['artifacts'].append(projected)
+                    current_packet[field]['artifacts'].sort(key=lambda item:item['id'])
+                for member in current_packet['members']:
+                    member['decision_binding']=member_bindings[member['decision']]
+                need(digest(current_packet)==proof['current_material_digest'] and
+                     result.get('current_material_digest')==proof['current_material_digest'],
+                     'invalid_snapshot','Incremental batch delta does not reconstruct the reviewed current packet')
+    incremental_reviews=spec.get('decision_incremental_reviews',[])
+    need(isinstance(incremental_reviews,list),'invalid_snapshot',
+         'Incremental decision review history is malformed')
+    seen_incremental_events=set()
+    for record in incremental_reviews:
+        need(isinstance(record,dict) and isinstance(record.get('id'),str) and
+             record['id'] not in seen_incremental_events and record.get('project')==spec['project'] and
+             type(record.get('seq')) is int and record['seq']>0 and isinstance(record.get('body'),dict),
+             'invalid_snapshot','Incremental decision review event is malformed')
+        seen_incremental_events.add(record['id'])
+        body=record['body'];decision_id=body.get('decision');proof=body.get('proof')
+        need(isinstance(proof,dict) and decision_id in registries['decisions'] and
+             body.get('base_review_receipt')==proof.get('base_review_receipt') and
+             isinstance(body.get('supplemental_review_receipt'),str) and
+             body.get('current_material_digest')==proof.get('current_material_digest'),
+             'invalid_snapshot','Incremental decision review event references disagree')
+        base_material=proof.get('base_material') if isinstance(proof,dict) else None
+        need(isinstance(base_material,dict) and base_material.get('format')=='decision-review-material.v1' and
+             base_material.get('decision')==decision_id,
+             'invalid_snapshot','Incremental decision review has no frozen single-decision base material')
+        addition=validate_delta_snapshot(proof,decision_id,'decision',base_material)
+        old_rows=base_material.get('current_artifacts')
+        need(isinstance(old_rows,list) and addition['id'] not in {item.get('id') for item in old_rows},
+             'invalid_snapshot','Incremental decision requirement was already in its base material')
+        current_material=copy.deepcopy(base_material)
+        current_material['current_artifacts'].append({
+            'id':addition['id'],'revision':addition['revision'],'digest':addition['digest'],
+            'status':addition['status']})
+        current_material['current_artifacts'].sort(key=lambda item:item['id'])
+        need(digest(current_material)==proof['current_material_digest'],
+             'invalid_snapshot','Incremental decision delta does not reconstruct the reviewed material')
     need(len({r['id'] for r in spec['attempts']})==len(spec['attempts']),'invalid_snapshot','Duplicate attempt IDs')
     for attempt in spec['attempts']:
         need(attempt['change_id'] in registries['changes'],'invalid_snapshot','Attempt has no change')
@@ -286,6 +536,8 @@ def _validate_specifications(spec, *, include_projection=False):
     counts={'artifacts':len(artifacts),'revisions':len(revisions),'sources':len(sources),
             'classifications':len(spec['dispositions']),'links':len(spec['links']),
             'documents':len(documents),'decisions':len(spec['decisions']),'changes':len(spec['changes']),
+            'decision_batches':len(decision_batches),
+            'decision_incremental_reviews':len(incremental_reviews),
             **local_counts}
     return {'counts':counts,**source_projection} if include_projection else counts
 
@@ -451,6 +703,13 @@ class KnowledgeHistory:
                   'fresh_review_or_test_evidence':False}
             for table in ('decisions','changes','conflicts','documents'):
                 spec[table]=[decoded(r) for r in self.s.all(f'SELECT * FROM {table} WHERE project=? ORDER BY id',(project,))]
+            spec['decision_batches']=[decoded(r) | {'result':parse_json(r['result']) if r['result'] else None}
+                for r in self.s.all('SELECT * FROM decision_batches WHERE project=? ORDER BY created,id',(project,))]
+            spec['decision_incremental_reviews']=[
+                {'id':r['id'],'seq':r['seq'],'project':r['project'],'actor':r['actor'],
+                 'created':r['created'],'body':parse_json(r['body'])}
+                for r in self.s.all("SELECT id,seq,project,actor,created,body FROM events WHERE project=? "
+                    "AND kind='decision_incremental_review_applied' ORDER BY seq,id",(project,))]
             programs=[decoded(r) for r in self.s.all('SELECT * FROM programs WHERE project=? ORDER BY id',(project,))]
             origin_rows=[decoded(r) for r in self.s.all('SELECT * FROM program_origins WHERE project=? ORDER BY program',(project,))]
             validate_origin_rows(programs, origin_rows, project, code='invalid_snapshot')
@@ -555,7 +814,7 @@ class KnowledgeHistory:
         with self.s.transaction():
             validate_origin_store(self.s)
             estimated = self.s.one('SELECT COALESCE(sum(characters),0)*4 AS n FROM sources WHERE project=?',(project,))['n']
-            for table in ('artifacts','decisions','changes','conflicts','documents','programs','breakdowns','breakdown_packets'):
+            for table in ('artifacts','decisions','changes','conflicts','decision_batches','documents','programs','breakdowns','breakdown_packets'):
                 estimated += 2*self.s.one(f'SELECT COALESCE(sum(length(CAST(body AS BLOB))),0) AS n FROM {table} WHERE project=?',(project,))['n']
             estimated += 2*self.s.one('SELECT COALESCE(sum(length(CAST(r.body AS BLOB))),0) AS n FROM revisions r JOIN artifacts a ON a.id=r.artifact WHERE a.project=?',(project,))['n']
             estimated += 2*self.s.one("SELECT COALESCE(sum(json_extract(body,'$.bytes')),0) AS n FROM documents WHERE project=?",(project,))['n']

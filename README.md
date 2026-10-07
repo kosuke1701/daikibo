@@ -10,6 +10,10 @@ technical documentation, and runnable examples. Development logs, historical
 review evidence, prebuilt packages, and third-party dependencies are not
 included.
 
+The [decision and change lifecycle guide](docs/DECISION-LIFECYCLE.md) explains
+how to review and atomically apply decision batches and how to handle tightly
+scoped title-only repairs.
+
 ## Requirements
 
 - Linux
@@ -117,11 +121,23 @@ retained; use the normal change/reopen workflow for changes to existing work.
 Native answers and notification acknowledgements reference their original
 human source and record a separate exact quote for each target. They never
 classify a mixed user turn as entirely non-requirement text.
+Decision options with linked changes bind each choice to an explicit effect:
+`approve` applies the proposal, while `keep_existing` preserves the current
+specification and closes the declined change workflow. Custom options on a
+side-effecting proposal declare `choice_effects`; standalone custom options
+remain record-only. A response retry under another RPC request ID should pass
+the original source, choice and exact quote to remain a no-op. Changing the
+choice requires a new source recorded after the prior response; omitting the
+source creates a new authenticated response observation.
 Pass a notification's catalog digest as `expected_digest` when acknowledging
 it to reject a changed notice; acknowledgement records the exact notice digest.
 Changed notices require a human source recorded after that notice version was
 published. Reusing an answer to an earlier version is rejected, including when
 the wall clock moves backwards. Identical notice resends preserve the version.
+Generic acknowledgement cannot answer product or provisional decisions or
+resolve conflicts. Automatic notice closure is recorded separately from a
+human acknowledgement; a later acknowledgement retry is accepted only when
+the exact human acknowledgement remains current for that notice.
 For notices, `created` is the current version's display timestamp; publication
 and source event sequences determine the actual ordering of versions and answers.
 Saved Contexts retain their historical material; `context.fresh` also checks

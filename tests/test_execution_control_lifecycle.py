@@ -282,6 +282,30 @@ def test_core_reserved_attempt_is_retained_by_archive_roundtrip(full, full_proje
     assert inspected["counts"]["execution_attempts"] == 1
 
 
+def test_execution_control_policy_apply_requires_latest_review(full,full_project,tmp_path):
+    project,_,proposal,first=_execution_policy_proposal(full,full_project,tmp_path)
+    script=tmp_path/'policy-fail-review.py'
+    script.write_text('''import json,sys
+p=json.load(sys.stdin);c=p.get('context',{});markers=c.get('required_coverage',[])
+print(json.dumps({'verdict':'fail','rationale':'The later fixture review fails.','covered':markers,
+ 'findings':[],'observations':[{'ref':p.get('subject','policy'),'detail':'Observed the reviewed policy packet.'}],
+ 'dispositions':[]}))
+''')
+    full.rt.adapters.register(full.owner,'policy_fail_review','fixture',sys.executable,[str(script)])
+    failed=full.rt.review(full.owner,proposal['id'],'consistency','policy_fail_review')
+    assert failed['result']['verdict']=='fail'
+    with pytest.raises(Fault) as stale:
+        full.execution_controls.policy_apply(full.owner,proposal['id'],proposal['digest'],first['receipt'])
+    assert stale.value.code=='stale_evidence'
+    assert full.g.policy(project)['revision']==1
+
+    fresh=full.rt.review(full.owner,proposal['id'],'consistency','policy_consistency')
+    assert fresh['result']['verdict']=='pass'
+    result=full.execution_controls.policy_apply(full.owner,proposal['id'],proposal['digest'],fresh['receipt'])
+    assert result['status']=='applied'
+    assert full.g.policy(project)['revision']==2
+
+
 def test_core_claim_event_survives_schema12_migration_and_legacy_archive_roundtrip(full, full_project, tmp_path):
     """A real core claim remains selectable after migration without backfill."""
     task = make_task(full, full_project)

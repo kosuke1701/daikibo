@@ -167,7 +167,7 @@ def test_real_schema15_fixture_migrates_twice_without_changing_old_rows(tmp_path
     )
     try:
         control.owner = control.sec.authenticate(None)
-        assert control.s.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION == 16
+        assert control.s.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION == 17
         assert (home / "pre-migration-v15.sqlite3").is_file()
         assert dict(control.s.one("SELECT * FROM programs WHERE id=?", (before["program"],))) == before["program_row"]
         assert control.s.one("SELECT count(*) AS n FROM sources WHERE project=?", (before["project"],))["n"] == before["source_count"]

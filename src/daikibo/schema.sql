@@ -42,6 +42,17 @@ CREATE TABLE IF NOT EXISTS decisions (
  body TEXT NOT NULL CHECK(json_valid(body)), digest TEXT NOT NULL, status TEXT NOT NULL,
  response TEXT, source TEXT REFERENCES sources(id), consistency_receipt TEXT, created REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS decision_batches (
+ id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(id),
+ body TEXT NOT NULL CHECK(json_valid(body)), digest TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('prepared','applied')),
+ result TEXT CHECK(result IS NULL OR json_valid(result)), created REAL NOT NULL, applied REAL
+);
+CREATE INDEX IF NOT EXISTS decision_batches_project ON decision_batches(project,created,id);
+CREATE TRIGGER IF NOT EXISTS decision_batches_immutable BEFORE UPDATE OF project,body,digest,created ON decision_batches
+ BEGIN SELECT RAISE(ABORT,'immutable decision batch packet'); END;
+CREATE TRIGGER IF NOT EXISTS decision_batches_no_delete BEFORE DELETE ON decision_batches
+ BEGIN SELECT RAISE(ABORT,'retain decision batch history'); END;
 CREATE TABLE IF NOT EXISTS inbox (
  id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(id), kind TEXT NOT NULL, ref TEXT NOT NULL,
  body TEXT NOT NULL CHECK(json_valid(body)), severity TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',

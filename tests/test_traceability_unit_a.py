@@ -217,7 +217,7 @@ def test_schema13_migration_creates_traceability_tables_without_fabricating_rows
     db.execute("PRAGMA user_version=13"); db.commit(); db.close()
     reopened = Control(home, mode="validation", start_workers=False)
     try:
-        assert reopened.s.one("PRAGMA user_version")["user_version"] == 16
+        assert reopened.s.one("PRAGMA user_version")["user_version"] == 17
         assert reopened.s.one("SELECT count(*) AS n FROM traceability_revisions")["n"] == 0
     finally:
         reopened.close()

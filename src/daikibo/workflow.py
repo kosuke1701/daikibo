@@ -31,6 +31,7 @@ class Workflow:
     def __init__(self,store,security,knowledge,governance,execution_controls=None):
         self.s,self.sec,self.k,self.g=store,security,knowledge,governance
         self.control=None
+        self.planning=None
         self.execution_controls=execution_controls
         # Control/Runtime binds the existing immutable verification-material
         # coordinator after composition.  Keeping this private avoids adding
@@ -641,12 +642,14 @@ class Workflow:
                     self.s.execute("UPDATE waivers SET status='expired' WHERE id=? AND status='active'",(timer['ref'],))
                     self.g.inbox(timer['project'],'waiver',timer['ref'],{'expired':True,'required_action':'remediation'},'critical',timer['due'])
                 elif timer['kind']=='decision_expiry':
-                    decision=self.s.one('SELECT body,status FROM decisions WHERE id=?',(timer['ref'],))
-                    if decision and decision['status']=='provisional':
-                        body=parse_json(decision['body'])
-                        self.s.execute("UPDATE decisions SET status='expired' WHERE id=?",(timer['ref'],))
-                        if body.get('refs'):self.k.invalidate(timer['project'],body['refs'],'Provisional decision expired')
-                        self.g.inbox(timer['project'],'decision',timer['ref'],{'expired':True,'must_reconcile':True},'critical',timer['due'])
+                    self.planning._expire_due_decision(timer['project'],timer['ref'],actor='system',now=now)
+                    still_pending=self.s.one('SELECT fired FROM timers WHERE id=?',(timer['id'],),True)
+                    if still_pending['fired'] is None:
+                        self.s.execute('UPDATE timers SET fired=? WHERE id=? AND fired IS NULL',(now,timer['id']))
+                        self.sec.event(timer['project'],'timer_fired','system',
+                                       {'timer':timer['id'],'reason':'decision_missing',
+                                        'lag_seconds':max(0,now-timer['due'])})
+                    continue
                 elif timer['kind']=='inbox_reminder':
                     self.s.execute("UPDATE inbox SET status='open' WHERE id=?",(timer['ref'],))
                 self.s.execute("UPDATE timers SET fired=? WHERE id=?",(now,timer['id']))

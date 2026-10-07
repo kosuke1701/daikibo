@@ -1819,7 +1819,7 @@ def test_schema11_migrates_additively_and_local_archive_includes_assurance_v11(l
     reopened = Control(old_home, mode="validation", start_workers=False)
     try:
         reopened.owner = reopened.sec.authenticate(None)
-        assert reopened.s.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION == 16
+        assert reopened.s.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION == 17
         assert (old_home / "pre-migration-v11.sqlite3").is_file()
         assert reopened.s.one("SELECT count(*) AS n FROM local_execution_proposals")["n"] == 0
         assert reopened.s.one("SELECT count(*) AS n FROM local_execution_packets")["n"] == 0

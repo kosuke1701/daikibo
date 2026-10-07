@@ -41,7 +41,7 @@ def test_registry_has_exactly_thirteen_contracts_and_catalog_is_detached(full):
     assert catalog["registry_digest"] == REGISTRY_DIGEST
     catalog["relations"][0]["relation"] = "tampered"
     assert full.assurance.catalog(full.owner)["relations"][0]["relation"] != "tampered"
-    assert catalog["schema"] == SCHEMA_VERSION == 16
+    assert catalog["schema"] == SCHEMA_VERSION == 17
 
 
 def test_immutable_object_refs_and_head_compare_swap(full):
@@ -95,7 +95,7 @@ def test_schema15_migration_and_existing_backup_barrier(tmp_path):
     store.conn.executescript("DROP TABLE program_origins; DROP TABLE assurance_refs; DROP TABLE assurance_heads; DROP TABLE assurance_events; DROP TABLE assurance_objects; PRAGMA user_version=14;")
     store.close()
     migrated = Store(home)
-    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 16
+    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 17
     assert migrated.one("SELECT name FROM sqlite_master WHERE name='assurance_objects'")
     migrated.close()
     barrier = tmp_path / "barrier"

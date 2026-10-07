@@ -69,7 +69,9 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `change.apply` | `(actor, change, review_receipt)` | false |
 | `change.attempt` | `(actor, change, level, body)` | false |
 | `change.delta` | `(actor, change, expected_revision, deltas, reason, force_revision=False)` | false |
+| `change.get` | `(actor, change)` | true |
 | `change.propose` | `(actor, project, body)` | false |
+| `change.read` | `(actor, change, expected_digest, offset=0, byte_budget=12000)` | true |
 | `change.withdraw` | `(actor, change, reason, compensation)` | false |
 | `code.consumers` | `(actor, project, symbol, limit=100, offset=0, expected_snapshot=None)` | true |
 | `code.inventory` | `(actor, project)` | true |
@@ -88,10 +90,16 @@ run.work_changes / run.work_readはproject-scopedな通常run working-productを
 | `contract.schema_capabilities` | `(actor)` | true |
 | `contract.validate` | `(actor, schema, value)` | true |
 | `decision.apply` | `(actor, decision, review_receipt)` | false |
+| `decision.batch_apply` | `(actor, batch, review_receipt)` | false |
+| `decision.batch_get` | `(actor, batch, incremental_from=None)` | true |
+| `decision.batch_prepare` | `(actor, project, decisions)` | false |
+| `decision.batch_read` | `(actor, batch, expected_digest, offset=0, byte_budget=12000)` | true |
 | `decision.get` | `(actor, decision)` | true |
 | `decision.propose` | `(actor, project, body)` | false |
+| `decision.read` | `(actor, decision, expected_digest, offset=0, byte_budget=12000)` | true |
 | `decision.recent` | `(actor, project, since=0)` | true |
 | `decision.respond` | `(actor, decision, expected_digest, choice, utterance, source=None)` | false |
+| `decision.review_subject` | `(actor, decision, incremental_from=None)` | true |
 | `delivery.certify` | `(actor, delivery, check_only=False)` | false |
 | `delivery.commit` | `(actor, delivery, message)` | false |
 | `delivery.configure` | `(actor, project, body, expected_digest=None, review_receipt=None)` | false |

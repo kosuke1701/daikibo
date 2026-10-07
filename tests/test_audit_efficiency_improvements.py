@@ -139,7 +139,8 @@ def test_same_delta_preserves_answer_but_changed_reason_does_not(full, full_proj
     change=c.p.change(c.owner,p,{'title':'Investigate','origin':'user','reason':'Check meaning','affected':[req],'evidence':[src],'source':src})
     c.p.set_delta(c.owner,change['id'],1,[],'Same proposal')
     decision=c.p.propose_decision(c.owner,p,{'title':'Choose','reason':'Check meaning','options':['yes'],
-        'recommendation':'yes','refs':[req],'requirement_affecting':True,'change':change['id']})
+        'recommendation':'yes','refs':[req],'requirement_affecting':True,'change':change['id'],
+        'choice_effects':{'yes':'accept'}})
     c.p.respond(c.owner,decision['id'],decision['digest'],'yes','Yes')
     replay=c.p.set_delta(c.owner,change['id'],2,[],'Same proposal')
     assert replay['unchanged'] and c.decision_get(c.owner,decision['id'])['status']=='decision_received'
