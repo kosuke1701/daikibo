@@ -10,6 +10,7 @@ import pytest
 
 from daikibo.common import Actor, Fault, canonical, digest, parse_json, timestamp
 from daikibo.rpc import Client, Server, MAX_FRAME
+from conftest import route_change_to_product
 from test_task_definition_revisions import revision_setup, propose, review
 
 
@@ -138,13 +139,15 @@ def test_same_delta_preserves_answer_but_changed_reason_does_not(full, full_proj
     src=c.s.one('SELECT id FROM sources WHERE project=?',(p,))['id']
     change=c.p.change(c.owner,p,{'title':'Investigate','origin':'user','reason':'Check meaning','affected':[req],'evidence':[src],'source':src})
     c.p.set_delta(c.owner,change['id'],1,[],'Same proposal')
+    assert route_change_to_product(c,change['id'])=='awaiting_product_decision'
     decision=c.p.propose_decision(c.owner,p,{'title':'Choose','reason':'Check meaning','options':['yes'],
         'recommendation':'yes','refs':[req],'requirement_affecting':True,'change':change['id'],
         'choice_effects':{'yes':'accept'}})
     c.p.respond(c.owner,decision['id'],decision['digest'],'yes','Yes')
-    replay=c.p.set_delta(c.owner,change['id'],2,[],'Same proposal')
+    current_revision=c.p.change_get(c.owner,change['id'])['revision']
+    replay=c.p.set_delta(c.owner,change['id'],current_revision,[],'Same proposal')
     assert replay['unchanged'] and c.decision_get(c.owner,decision['id'])['status']=='decision_received'
-    c.p.set_delta(c.owner,change['id'],2,[],'Different justification')
+    c.p.set_delta(c.owner,change['id'],current_revision,[],'Different justification')
     assert c.decision_get(c.owner,decision['id'])['status']=='superseded'
 
 

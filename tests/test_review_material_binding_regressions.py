@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from daikibo.common import Actor, Fault, digest, parse_json
+from conftest import route_change_to_product
 
 
 def _reviewer(control, tmp_path):
@@ -130,12 +131,22 @@ def test_artifact_acceptance_binds_sources_invariants_and_latest_verdict(full, t
         "deltas": [{"artifact": invariant["id"], "expected_revision": 1,
                     "body": {**invariant["body"], "statement": "Feature A is prohibited"}}],
     })
-    full.p.attempt(full.owner, change["id"], "local_repair", {
-        "hypothesis": "Update the canonical policy", "alternatives": ["Retain the old rule"],
-        "evidence": [old["receipt"]], "outcome": "solution", "remaining_unknown": "",
+    full.rt.adapters.register(
+        full.owner, "fixture", "fixture", sys.executable,
+        [str(Path(__file__).with_name("fixture_agent.py"))],
+    )
+    assert route_change_to_product(full, change["id"]) == "awaiting_product_decision"
+    decision = full.p.propose_decision(full.owner, project, {
+        "title": "Adopt the updated feature policy",
+        "reason": "The reviewed policy changes the accepted feature boundary.",
+        "options": ["approve", "keep_existing"], "recommendation": "approve",
+        "refs": [invariant["id"]], "requirement_affecting": True,
+        "change": change["id"],
     })
-    consistency = full.rt.review(full.owner, change["id"], "consistency", "material-reviewer")
-    full.p.apply_technical_change(full.owner, change["id"], consistency["receipt"])
+    full.p.respond(full.owner, decision["id"], decision["digest"], "approve",
+                   "Approve the exact reviewed policy update")
+    consistency = full.rt.review(full.owner, decision["id"], "consistency", "fixture")
+    full.p.apply_decision(full.owner, decision["id"], consistency["receipt"])
 
     state.write_text("fail")
     current_fail = full.rt.review(full.owner, requirement["id"], "requirements", "material-reviewer")

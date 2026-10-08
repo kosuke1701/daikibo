@@ -1,7 +1,7 @@
 import copy
 import pytest
 from daikibo.common import Actor,Fault,canonical,digest,parse_json,timestamp
-from conftest import make_task
+from conftest import make_task,route_change_to_product
 
 
 def proposal(c,p,q,**extra):
@@ -15,7 +15,8 @@ def test_new_user_change_authentic_adjudication_rechecks_then_replans(full,full_
     updated={**old['body'],'statement':'Returns the exact integer arithmetic sum'}
     change=c.p.change(c.owner,p,{'title':'Precision','origin':'user','reason':'Explicit revised product constraint','source':source['id'],'affected':[q],'evidence':[source['id']],
                                 'deltas':[{'artifact':q,'expected_revision':1,'body':updated}]})
-    assert change['stage']=='awaiting_product_decision'
+    assert change['stage']=='local_repair'
+    assert route_change_to_product(c,change['id'])=='awaiting_product_decision'
     assert c.w.task(c.owner,t)['validity']=='needs_review'
     d=c.p.propose_decision(c.owner,p,proposal(c,p,q,change=change['id']))
     agent=Actor('test-agent','agent',p)
@@ -72,6 +73,7 @@ def test_secondary_conflict_prevents_applying_even_approved_delta(full,full_proj
     current=c.k.artifact(c.owner,q)
     change=c.p.change(c.owner,p,{'title':'Async','origin':'user','reason':'New request','source':src['id'],'affected':[q],'evidence':[src['id']],
                               'deltas':[{'artifact':q,'expected_revision':1,'body':{**current['body'],'constraints':{'mode':'async'}}}]})
+    assert route_change_to_product(c,change['id'])=='awaiting_product_decision'
     d=c.p.propose_decision(c.owner,p,proposal(c,p,q,change=change['id']))
     c.p.respond(c.owner,d['id'],d['digest'],'approve','Approved without silently removing other constraints')
     review=c.rt.review(c.owner,d['id'],'consistency','fixture')

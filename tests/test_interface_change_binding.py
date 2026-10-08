@@ -138,6 +138,8 @@ def test_apply_rechecks_the_same_consumer_snapshot(change_case):
     revise(c,consumer,statement='A consumer now interprets milliseconds')
     with pytest.raises(Fault):c.p.apply_technical_change(c.owner,ch['id'],final['receipt'])
     assert c.k.artifact(c.owner,i)['revision']==1
+    c.p.set_delta(c.owner,ch['id'],c.p.change_get(c.owner,ch['id'])['revision'],
+                  [delta],'Refresh the controller impact fence after consumer revision')
     new=review(c,ch);out=c.p.apply_technical_change(c.owner,ch['id'],new['receipt'])
     assert out['stage']=='ready_for_reimplementation' and out['reassessment_required']
     assert c.k.artifact(c.owner,i)['revision']==2

@@ -14,7 +14,7 @@ import pytest
 from daikibo.common import Actor, Fault, canonical, digest, parse_json, timestamp
 from daikibo.db import SCHEMA_VERSION, Store
 from daikibo.knowledge_history import validate_specifications
-from conftest import make_task
+from conftest import make_task,route_change_to_product
 
 
 def _proposal(ref, **extra):
@@ -42,6 +42,7 @@ def _user_decision(c, project, artifact, *, statement=None, constraints=None,
         'reason':'Apply the requested requirement change','source':source['id'],
         'affected':[artifact],'evidence':[source['id']],
         'deltas':[{'artifact':artifact,'expected_revision':old['revision'],'body':after}]})
+    assert route_change_to_product(c,change['id'])=='awaiting_product_decision'
     decision=c.p.propose_decision(c.owner,project,_proposal(artifact,change=change['id']))
     if auto_answer:
         c.p.respond(c.owner,decision['id'],decision['digest'],'approve',source_answer)
@@ -65,12 +66,12 @@ def _linked_change(c, project, artifact, statement):
         'reason':'Apply the exact user request','source':source['id'],'affected':[artifact],
         'evidence':[source['id']],'deltas':[{'artifact':artifact,
             'expected_revision':current['revision'],'body':{**current['body'],'statement':statement}}]})
+    assert route_change_to_product(c,change['id'])=='awaiting_product_decision'
     return change['id'],current['body']
 
 
 def _register_coverage_reviewer(c, tmp_path, name='lifecycle-reviewer'):
-    script=tmp_path/(name+'.py')
-    script.write_text('''import json,sys\np=json.load(sys.stdin)\nc=p.get("context",{})\nrefs=set()\ndef walk(v):\n if isinstance(v,dict):\n  if isinstance(v.get("artifact"),str): refs.add(v["artifact"])\n  if isinstance(v.get("affected"),list): refs.update(x for x in v["affected"] if isinstance(x,str))\n  if isinstance(v.get("refs"),list): refs.update(x for x in v["refs"] if isinstance(x,str))\n  if isinstance(v.get("id"),str) and v["id"].startswith(("REQUIREMENT-","ARTIFACT-","INTERFACE-","DESIGN-")): refs.add(v["id"])\n  for x in v.values(): walk(x)\n elif isinstance(v,list):\n  for x in v: walk(x)\nwalk(c)\nprint(json.dumps({"verdict":"pass","rationale":"Deterministic test double only.","covered":c.get("required_coverage",[]),"findings":[],"observations":[{"ref":r,"detail":"Fixture observed this exact retained artifact."} for r in sorted(refs)],"dispositions":[]}))\n''')
+    script=Path(__file__).with_name('fixture_agent.py')
     c.rt.adapters.register(c.owner,name,'fixture',sys.executable,[str(script)])
     return name
 
@@ -81,6 +82,13 @@ def _register_verdict_reviewer(c, tmp_path, verdict, name):
 p=json.load(sys.stdin);c=p.get("context",{});refs=c.get("proposal",{}).get("refs",[])
 print(json.dumps({"verdict":'''+repr(verdict)+''',"rationale":"Deterministic regression fixture.","covered":c.get("required_coverage",[]),"findings":[],"observations":[{"ref":x,"detail":"Fixture reviewed the exact bound context."} for x in refs] or [{"ref":p.get("subject","review"),"detail":"Fixture reviewed the exact bound context."}],"dispositions":[]}))
 ''')
+    c.rt.adapters.register(c.owner,name,'fixture',sys.executable,[str(script)])
+    return name
+
+
+def _register_uncovered_reviewer(c,tmp_path,name='uncovered-reviewer'):
+    script=tmp_path/(name+'.py')
+    script.write_text('''import json,sys\np=json.load(sys.stdin);c=p.get("context",{})\nprint(json.dumps({"verdict":"pass","rationale":"Intentional coverage omission for regression.","covered":[],"findings":[],"observations":[],"dispositions":[]}))\n''')
     c.rt.adapters.register(c.owner,name,'fixture',sys.executable,[str(script)])
     return name
 
@@ -224,10 +232,11 @@ def test_batch_review_requires_every_member_and_rejects_a_stale_baseline(full,fu
     _,d1=_user_decision(c,project,first,statement='Updated first')
     _,d2=_user_decision(c,project,second,statement='Updated second')
     prepared=c.p.decision_batch_prepare(c.owner,project,[d1,d2])
-    ordinary=c.rt.review(c.owner,prepared['id'],'consistency','fixture')
+    ordinary=c.rt.review(c.owner,prepared['id'],'consistency',_register_uncovered_reviewer(c,tmp_path))
+    assert ordinary['result']['verdict']=='blocked'
     with pytest.raises(Fault) as uncovered:
         c.p.decision_batch_apply(c.owner,prepared['id'],ordinary['receipt'])
-    assert uncovered.value.code=='incomplete_review_coverage'
+    assert uncovered.value.code=='review_failed'
     reviewer=_register_coverage_reviewer(c,tmp_path)
     review=c.rt.review(c.owner,prepared['id'],'consistency',reviewer)
     # Even an exact pass is stale after any member of the frozen common
@@ -289,8 +298,10 @@ print(json.dumps({'verdict':'pass','rationale':'Protocol fixture read the exact 
 def test_legacy_exact_response_quote_can_be_bound_into_batch_without_reasking(full,full_project,tmp_path,monkeypatch):
     c=full;project,_,first,_=full_project
     second=_accepted_requirement(c,project,'Legacy proof peer','Another independent behavior')
-    _,d1=_user_decision(c,project,first,source_answer='Exact retained answer for first')
-    _,d2=_user_decision(c,project,second,source_answer='Exact retained answer for second')
+    _,d1=_user_decision(c,project,first,statement='Exact revised body for first',
+                        source_answer='Exact retained answer for first')
+    _,d2=_user_decision(c,project,second,statement='Exact revised body for second',
+                        source_answer='Exact retained answer for second')
     original=c.p.response_evidence
     def old_shape(decision):
         result=original(decision)
@@ -343,7 +354,8 @@ def test_delta_terminalizes_only_its_pending_decisions_and_refreshes_exact_notic
     old_body=parse_json(c.s.one('SELECT body FROM changes WHERE id=?',(change,))['body'])
     old_delta=old_body['deltas'][0]
     revised={**old_delta['body'],'statement':'A later, exact replacement proposal'}
-    updated=c.p.set_delta(c.owner,change,1,[{**old_delta,'body':revised}],'Revise the proposal')
+    revision=c.p.change_get(c.owner,change)['revision']
+    updated=c.p.set_delta(c.owner,change,revision,[{**old_delta,'body':revised}],'Revise the proposal')
     decision_row=c.s.one('SELECT status,source,response FROM decisions WHERE id=?',(decision,))
     assert decision_row=={'status':'superseded','source':answer,'response':'approve'}
     blocks={(r['kind'],r['ref']) for r in c.s.all('SELECT kind,ref FROM blocks WHERE task=?',(task,))}
@@ -353,7 +365,7 @@ def test_delta_terminalizes_only_its_pending_decisions_and_refreshes_exact_notic
     notice=c.s.one("SELECT body,status FROM inbox WHERE project=? AND kind='product_decision' AND ref=?",
                    (project,change))
     published=parse_json(notice['body'])
-    assert notice['status']=='open' and published['revision']==2
+    assert notice['status']=='open' and published['revision']==revision+1
     assert published['binding']==updated['binding'] and published['body']!=old_body
     assert published['body']['deltas'][0]['body']==revised
     assert c.s.one("SELECT status FROM inbox WHERE ref=? AND kind='product_decision'",(decision,))['status']=='acknowledged'
@@ -551,7 +563,7 @@ def test_title_plus_withdraw_does_not_enter_technical_repair_route(full,full_pro
     consistency=c.rt.review(c.owner,change['id'],'consistency','fixture')
     with pytest.raises(Fault) as rejected:
         c.p.apply_technical_change(c.owner,change['id'],consistency['receipt'])
-    assert rejected.value.code=='product_decision_required'
+    assert rejected.value.code=='scope_escalation_required'
     assert c.k.artifact(c.owner,artifact)['status']=='accepted'
     assert c.k.artifact(c.owner,artifact)['revision']==1
 
@@ -1040,6 +1052,7 @@ def _keep_existing_decision(c, project, artifact, source_text='The user asks for
         'reason':'Apply the user request if approved','source':source['id'],'affected':[artifact],
         'evidence':[source['id']],'deltas':[{'artifact':artifact,'expected_revision':current['revision'],
             'body':{**current['body'],'statement':'Requested behavior'}}]})
+    assert route_change_to_product(c,change['id'])=='awaiting_product_decision'
     proposal=c.p.propose_decision(c.owner,project,_proposal(artifact,change=change['id']))
     answer=c.k.source(c.owner,project,'Keep the existing requirement as-is.')
     c.p.respond(c.owner,proposal['id'],proposal['digest'],'keep_existing',
@@ -1185,6 +1198,136 @@ def test_incremental_batch_review_keeps_frozen_packet_and_exports_reconstruction
     assert archived['result']['incremental_proof']['base_review_receipt']==base
     assert archived['result']['incremental_proof']['added_artifact']['id']==added
     assert validate_specifications(exported)['decision_batches']>=1
+
+
+def test_sequential_individual_applies_use_event_bound_supplemental_reviews(full,full_project,tmp_path):
+    c=full;project=full_project[0]
+    artifacts=[_accepted_requirement(c,project,'Sequential '+str(index),'Original behavior '+str(index))
+               for index in range(3)]
+    pairs=[_user_decision(c,project,artifact,statement='Updated behavior '+str(index))
+           for index,artifact in enumerate(artifacts)]
+    decisions=[item[1] for item in pairs]
+    reviewer=_register_coverage_reviewer(c,tmp_path,'sequential-apply-reviewer')
+    base_receipts={decision:c.rt.review(c.owner,decision,'consistency',reviewer)['receipt']
+                   for decision in decisions}
+    first=c.p.apply_decision(c.owner,decisions[0],base_receipts[decisions[0]])
+    assert first.get('review_mode') is None
+    results=[]
+    for index,decision in enumerate(decisions[1:],start=1):
+        preview=c.p.decision_review_subject(c.owner,decision,
+                                             incremental_from=base_receipts[decision])
+        assert preview['incremental_review']['available'] is True
+        assert preview['incremental_review']['applied_decisions']==decisions[:index]
+        supplemental=c.rt.review(c.owner,decision,'consistency',reviewer,
+            proposal={'incremental_from':base_receipts[decision]})['receipt']
+        receipt=c.g.receipt(supplemental)
+        run_body=parse_json(c.s.one('SELECT body FROM runs WHERE id=?',(receipt['run'],),True)['body'])
+        prompt=parse_json(c.s.blob_get(run_body['input_blob']))
+        assert prompt['context']['format']=='decision-apply-incremental-review.v1'
+        assert 'record-only decisions' in prompt['instructions']
+        assert 'Do not assume distinct artifact targets are independent' in prompt['instructions']
+        result=c.p.apply_decision(c.owner,decision,supplemental)
+        assert result['review_mode']=='incremental'
+        assert result['incremental_review_format']=='decision-apply-incremental-review.v1'
+        assert result['applied_decisions']==decisions[:index]
+        results.append((decision,supplemental))
+    assert [c.k.artifact(c.owner,artifact)['revision'] for artifact in artifacts]==[2,2,2]
+    assert [c.s.one('SELECT status FROM decisions WHERE id=?',(decision,))['status']
+            for decision in decisions]==['applied']*3
+    later=c.k.artifact(c.owner,artifacts[1])
+    c.k._revise(c.owner,later,later['revision'],
+        {**later['body'],'statement':'A later accepted revision after the supplemental apply.'},
+        'Fixture records a later accepted revision','accepted')
+    assert c.k.artifact(c.owner,artifacts[1])['revision']==3
+    archive=c.history.export_current(c.owner,project)
+    assert len(archive['decision_apply_incremental_reviews'])==2
+    assert validate_specifications(archive)['decision_apply_incremental_reviews']==2
+    corrupted=copy.deepcopy(archive)
+    proof=corrupted['decision_apply_incremental_reviews'][0]['body']['proof']
+    proof['applied_effects'][0]['after']['body']['statement']='Tampered prior decision result'
+    with pytest.raises(Fault) as invalid:
+        validate_specifications(corrupted)
+    assert invalid.value.code=='invalid_snapshot'
+
+    forged=copy.deepcopy(archive)
+    record=forged['decision_apply_incremental_reviews'][0]
+    proof=record['body']['proof']
+    proof['current_material']['policy']='forged-policy-pin'
+    forged_digest=digest(proof['current_material'])
+    proof['current_material_digest']=forged_digest
+    record['body']['current_material_digest']=forged_digest
+    with pytest.raises(Fault) as invalid_normalized:
+        validate_specifications(forged)
+    assert invalid_normalized.value.code=='invalid_snapshot'
+
+
+def test_sequential_record_only_decisions_carry_status_changes_without_artifact_effects(
+        full,full_project,tmp_path):
+    c=full;project=full_project[0]
+    artifacts=[_accepted_requirement(c,project,'Audit record '+str(index),'Existing behavior '+str(index))
+               for index in range(3)]
+    decisions=[]
+    for index,artifact in enumerate(artifacts):
+        body={'title':'Record independent audit '+str(index),'reason':'Record a non-side-effecting audit choice',
+              'options':['record'],'recommendation':'record','refs':[artifact],
+              'requirement_affecting':False,'choice_effects':{'record':'record_only'}}
+        proposed=c.p.propose_decision(c.owner,project,body)
+        utterance='Record this audit choice '+str(index)
+        source=c.k.source(c.owner,project,utterance,'answer:'+proposed['id'])
+        c.p.respond(c.owner,proposed['id'],proposed['digest'],'record',utterance,source=source['id'])
+        decisions.append(proposed['id'])
+    reviewer=_register_coverage_reviewer(c,tmp_path,'sequential-record-only-reviewer')
+    bases={decision:c.rt.review(c.owner,decision,'consistency',reviewer)['receipt']
+           for decision in decisions}
+    for index,decision in enumerate(decisions):
+        if index:
+            preview=c.p.decision_review_subject(c.owner,decision,incremental_from=bases[decision])
+            assert preview['incremental_review']['available'] is True
+            assert preview['incremental_review']['applied_decisions']==decisions[:index]
+            receipt=c.rt.review(c.owner,decision,'consistency',reviewer,
+                proposal={'incremental_from':bases[decision]})['receipt']
+        else:
+            receipt=bases[decision]
+        result=c.p.apply_decision(c.owner,decision,receipt)
+        assert result['status']=='applied'
+        if index:
+            assert result['incremental_review_format']=='decision-apply-incremental-review.v1'
+            assert result['applied_decisions']==decisions[:index]
+    assert [c.k.artifact(c.owner,artifact)['revision'] for artifact in artifacts]==[1,1,1]
+    archive=c.history.export_current(c.owner,project)
+    assert len(archive['decision_apply_incremental_reviews'])==2
+    assert validate_specifications(archive)['decision_apply_incremental_reviews']==2
+
+
+def test_sequential_archive_keeps_valid_supplemental_proof_after_later_supersession(
+        full,full_project,tmp_path):
+    c=full;project,repo,first,_=full_project
+    second=_accepted_requirement(c,project,'Superseded sequential target','Old second behavior')
+    third=_accepted_requirement(c,project,'Superseding decision target','Independent third behavior')
+    _,d1=_user_decision(c,project,first,statement='First applied behavior')
+    _,d2=_user_decision(c,project,second,statement='Second applied behavior')
+    reviewer=_register_coverage_reviewer(c,tmp_path,'sequential-supersession-reviewer')
+    bases={decision:c.rt.review(c.owner,decision,'consistency',reviewer)['receipt']
+           for decision in (d1,d2)}
+    c.p.apply_decision(c.owner,d1,bases[d1])
+    preview=c.p.decision_review_subject(c.owner,d2,incremental_from=bases[d2])
+    assert preview['incremental_review']['available'] is True
+    supplemental=c.rt.review(c.owner,d2,'consistency',reviewer,
+        proposal={'incremental_from':bases[d2]})['receipt']
+    c.p.apply_decision(c.owner,d2,supplemental)
+
+    body=_proposal(third,supersedes=d2)
+    replacement=c.p.propose_decision(c.owner,project,body)
+    utterance='Replace the already applied second decision with this new choice.'
+    source=c.k.source(c.owner,project,utterance,'answer:'+replacement['id'])
+    c.p.respond(c.owner,replacement['id'],replacement['digest'],'approve',utterance,source=source['id'])
+    review=c.rt.review(c.owner,replacement['id'],'consistency',reviewer)
+    c.p.apply_decision(c.owner,replacement['id'],review['receipt'])
+    assert c.s.one('SELECT status FROM decisions WHERE id=?',(d2,))['status']=='superseded'
+
+    archive=c.history.export_current(c.owner,project)
+    assert len(archive['decision_apply_incremental_reviews'])==1
+    assert validate_specifications(archive)['decision_apply_incremental_reviews']==1
 
 
 def test_incremental_delta_failure_cannot_be_applied_and_later_addition_stales_pass(full,full_project,tmp_path):

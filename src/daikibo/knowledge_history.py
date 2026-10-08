@@ -431,12 +431,22 @@ def _validate_specifications(spec, *, include_projection=False):
                 change_material=change.get('material') if isinstance(change,dict) else None
                 change_coverage=change_material.get('required_coverage',[]) if isinstance(change_material,dict) else None
                 change_body=change_material.get('body') if isinstance(change_material,dict) else None
-                need(isinstance(change_material,dict) and change_material.get('format')=='change-review-material.v1' and
+                need(isinstance(change_material,dict) and change_material.get('format') in {
+                         'change-review-material.v1','change-review-material.v2'} and
                      isinstance(change_body,dict) and isinstance(change_body.get('deltas',[]),list) and
                      isinstance(change_coverage,list) and all(isinstance(marker,str) for marker in change_coverage) and
                      canonical(member.get('change_material'))==canonical(change_material) and
                      digest(change_material)==change.get('binding'),
                      'invalid_snapshot','Decision batch change material differs from its member binding')
+                if change_material.get('format')=='change-review-material.v2':
+                    scope_review=change_material.get('scope_review')
+                    dispositions=scope_review.get('required_dispositions',[]) if isinstance(scope_review,dict) else None
+                    scope_ids=[item.get('id') for item in dispositions if isinstance(item,dict)] \
+                        if isinstance(dispositions,list) else None
+                    need(isinstance(scope_review,dict) and scope_review.get('format')=='change-scope-review.v1' and
+                         isinstance(scope_ids,list) and all(isinstance(marker,str) for marker in scope_ids) and
+                         len(set(scope_ids))==len(scope_ids) and set(scope_ids)<=set(change_coverage),
+                         'invalid_snapshot','Version-2 change scope markers are malformed or missing from coverage')
                 expected_coverage.update(change_coverage)
         need(set(packet_changes)==member_change_ids,
              'invalid_snapshot','Decision batch shared change set differs from its members')
@@ -526,6 +536,252 @@ def _validate_specifications(spec, *, include_projection=False):
         current_material['current_artifacts'].sort(key=lambda item:item['id'])
         need(digest(current_material)==proof['current_material_digest'],
              'invalid_snapshot','Incremental decision delta does not reconstruct the reviewed material')
+    decision_apply_reviews=spec.get('decision_apply_incremental_reviews',[])
+    need(isinstance(decision_apply_reviews,list),'invalid_snapshot',
+         'Sequential apply review history is malformed')
+    seen_apply_incremental_events=set()
+    for record in decision_apply_reviews:
+        need(isinstance(record,dict) and isinstance(record.get('id'),str) and
+             record['id'] not in seen_apply_incremental_events and record.get('project')==spec['project'] and
+             type(record.get('seq')) is int and record['seq']>0 and isinstance(record.get('body'),dict),
+             'invalid_snapshot','Sequential apply review event is malformed')
+        seen_apply_incremental_events.add(record['id'])
+        body=record['body'];decision_id=body.get('decision');proof=body.get('proof')
+        need(isinstance(decision_id,str) and decision_id in registries['decisions'] and
+             isinstance(proof,dict) and proof.get('format')=='decision-apply-incremental-proof.v1' and
+             proof.get('subject')==decision_id and body.get('base_review_receipt')==proof.get('base_review_receipt') and
+             isinstance(body.get('supplemental_review_receipt'),str) and
+             body.get('current_material_digest')==proof.get('current_material_digest'),
+             'invalid_snapshot','Sequential apply review event references disagree')
+        base_material=proof.get('base_material');current_material=proof.get('current_material')
+        need(isinstance(base_material,dict) and isinstance(current_material,dict) and
+             base_material.get('format')==current_material.get('format')=='decision-review-material.v1' and
+             base_material.get('decision')==current_material.get('decision')==decision_id and
+             proof.get('base_material_digest')==digest(base_material) and
+             proof.get('current_material_digest')==digest(current_material),
+             'invalid_snapshot','Sequential apply material snapshots are malformed')
+        current_decision=registries['decisions'][decision_id]
+        apply_events=body.get('application_events')
+        need(isinstance(apply_events,dict) and isinstance(apply_events.get('decision_event'),dict) and
+             current_decision.get('status') in {'applied','superseded'} and
+             current_decision.get('consistency_receipt')==body.get('supplemental_review_receipt'),
+             'invalid_snapshot','Sequential apply result does not reference its retained decision adoption')
+        own_decision_event=apply_events['decision_event'];own_decision_body=own_decision_event.get('body')
+        need(isinstance(own_decision_body,dict) and own_decision_body.get('decision')==decision_id and
+             own_decision_body.get('receipt')==body.get('supplemental_review_receipt') and
+             not own_decision_body.get('batch') and type(own_decision_event.get('seq')) is int and
+             0<own_decision_event['seq']<record['seq'],
+             'invalid_snapshot','Current decision apply event is missing or out of order')
+        current_proposal=current_material.get('proposal',{})
+        if current_proposal.get('change') and own_decision_body.get('selected_effect')=='accept':
+            own_change_event=apply_events.get('change_event')
+            own_artifact_events=apply_events.get('artifact_events')
+            linked_change=current_material.get('linked_change')
+            need(isinstance(own_change_event,dict) and isinstance(own_artifact_events,list) and
+                 isinstance(linked_change,dict) and isinstance(linked_change.get('material'),dict),
+                 'invalid_snapshot','Current linked change apply events are absent')
+            change_event_body=own_change_event.get('body')
+            change_id=current_proposal['change']
+            own_change=registries['changes'].get(change_id)
+            change_material=linked_change['material']
+            target_ids=(sorted(delta['artifact'] for delta in own_change['body'].get('deltas',[]))
+                        if isinstance(own_change,dict) else [])
+            need(isinstance(own_change,dict) and own_change.get('stage')=='ready_for_reimplementation' and
+                 isinstance(change_event_body,dict) and change_event_body.get('change')==change_id and
+                 change_event_body.get('decision')==decision_id and
+                 change_event_body.get('receipt')==body.get('supplemental_review_receipt') and
+                 change_event_body.get('changed')==target_ids and len(own_artifact_events)==len(target_ids) and
+                 own_decision_event['seq']>own_change_event.get('seq',0)>0,
+                 'invalid_snapshot','Current linked change event references disagree')
+            artifact_event_by={item.get('body',{}).get('id'):item for item in own_artifact_events
+                               if isinstance(item,dict) and isinstance(item.get('body'),dict)}
+            before_after={item.get('artifact'):item for item in change_material.get('before_after',[])
+                          if isinstance(item,dict)}
+            for target in target_ids:
+                delta=next(item for item in own_change['body'].get('deltas',[])
+                           if item['artifact']==target)
+                before_after_item=before_after.get(target);event_ref=artifact_event_by.get(target)
+                event_body=event_ref.get('body') if isinstance(event_ref,dict) else None
+                current_artifact=artifacts.get(target)
+                final_revision=revisions.get((target,delta['expected_revision']+1))
+                need(before_after_item is not None and event_body is not None and
+                     event_body.get('revision')==delta['expected_revision']+1 and
+                     event_body.get('digest')==digest(delta['body']) and
+                     event_ref.get('seq',0)<own_change_event['seq'] and
+                     current_artifact is not None and current_artifact.get('kind')==before_after_item.get('kind') and
+                     current_artifact.get('revision',0)>=delta['expected_revision']+1 and
+                     final_revision is not None and final_revision.get('status')=='accepted' and
+                     canonical(final_revision.get('body'))==canonical(delta['body']),
+                     'invalid_snapshot','Decision artifact apply event differs from its historical revision proof')
+        else:
+            need(apply_events.get('change_event') is None and apply_events.get('artifact_events')==[],
+                 'invalid_snapshot','A non-changing current decision has unexpected artifact apply events')
+        applied=proof.get('applied_effects')
+        need(isinstance(applied,list) and 1<=len(applied)<=20 and
+             len({item.get('decision') for item in applied if isinstance(item,dict)})==len(applied) and
+             len({item.get('target') for item in applied if isinstance(item,dict) and item.get('target')})==
+                 sum(bool(item.get('target')) for item in applied if isinstance(item,dict)),
+             'invalid_snapshot','Sequential apply effect list is malformed')
+        base_artifacts={item.get('id'):item for item in base_material.get('current_artifacts',[])
+                        if isinstance(item,dict)}
+        current_artifacts={item.get('id'):item for item in current_material.get('current_artifacts',[])
+                           if isinstance(item,dict)}
+        base_other={item.get('id'):item for item in base_material.get('other_decisions',[])
+                    if isinstance(item,dict)}
+        current_other={item.get('id'):item for item in current_material.get('other_decisions',[])
+                       if isinstance(item,dict)}
+        for effect in applied:
+            prior_id=effect.get('decision');target=effect.get('target')
+            decision_event=effect.get('decision_event');change_event=effect.get('change_event')
+            artifact_event=effect.get('artifact_event')
+            before=effect.get('before');after=effect.get('after')
+            need(isinstance(prior_id,str) and prior_id!=decision_id and prior_id in registries['decisions'] and
+                 isinstance(decision_event,dict) and
+                 (effect.get('selected_effect')=='record_only' or
+                  (isinstance(change_event,dict) and isinstance(artifact_event,dict))),
+                 'invalid_snapshot','Sequential apply effect identity is malformed')
+            previous=base_other.get(prior_id);current_prior=current_other.get(prior_id)
+            need(isinstance(previous,dict) and isinstance(current_prior,dict) and
+                 previous.get('status') in {'decision_received','provisional'} and
+                 current_prior.get('status')=='applied' and
+                 canonical({key:value for key,value in previous.items() if key!='status'})==
+                 canonical({key:value for key,value in current_prior.items() if key!='status'}),
+                 'invalid_snapshot','Sequential prior decision status transition differs')
+            d_event=decision_event.get('body')
+            c_event=change_event.get('body') if isinstance(change_event,dict) else None
+            a_event=artifact_event.get('body') if isinstance(artifact_event,dict) else None
+            prior_registry=registries['decisions'][prior_id]
+            prior_body=prior_registry.get('body')
+            need(isinstance(d_event,dict) and d_event.get('decision')==prior_id and
+                 not d_event.get('batch') and d_event.get('receipt')==effect.get('review_receipt') and
+                 type(decision_event.get('seq')) is int and decision_event['seq']>0 and
+                 decision_event['seq']<record['seq'],
+                 'invalid_snapshot','Sequential decision apply event sequence or receipt differs')
+            if effect.get('selected_effect')=='record_only':
+                need(target is None and before is None and after is None and
+                     effect.get('change') is None and effect.get('change_event') is None and
+                     effect.get('artifact_event') is None and d_event.get('selected_effect')=='record_only' and
+                     not any(prior_body.get(key) for key in ('change','conflict','supersedes')) and
+                     prior_body.get('type')!='policy',
+                     'invalid_snapshot','Record-only incremental effect has an unexpected artifact change')
+                continue
+            need(effect.get('selected_effect')=='accept' and isinstance(target,str) and
+                 isinstance(before,dict) and isinstance(after,dict) and isinstance(c_event,dict) and
+                 isinstance(a_event,dict) and d_event.get('selected_effect')=='accept' and
+                 before.get('id')==after.get('id')==target and
+                 before.get('revision')+1==after.get('revision') and
+                 before.get('status')==after.get('status')=='accepted' and
+                 c_event.get('decision')==prior_id and c_event.get('change')==effect.get('change') and
+                 c_event.get('receipt')==d_event.get('receipt') and c_event.get('changed')==[target] and
+                 a_event.get('id')==target and a_event.get('revision')==after.get('revision') and
+                 a_event.get('digest')==after.get('digest') and
+                 decision_event.get('seq')>change_event.get('seq')>artifact_event.get('seq')>0,
+                 'invalid_snapshot','Sequential apply event sequence or effect differs')
+            change_id=effect.get('change')
+            change=registries['changes'].get(change_id)
+            need(isinstance(prior_body,dict) and prior_body.get('change')==change_id and
+                 isinstance(change,dict) and change.get('stage')=='ready_for_reimplementation' and
+                 change.get('revision')==effect.get('change_revision') and
+                 digest(change.get('body'))==effect.get('change_body_digest'),
+                 'invalid_snapshot','Sequential applied change no longer matches its proof')
+            deltas=change['body'].get('deltas',[])
+            need(len(deltas)==1 and deltas[0].get('artifact')==target and
+                 not deltas[0].get('withdraw') and canonical(deltas[0].get('body'))==canonical(after.get('body')),
+                 'invalid_snapshot','Sequential applied delta does not match its change')
+            before_row=base_artifacts.get(target);after_row=current_artifacts.get(target)
+            need(before_row=={'id':target,'revision':before.get('revision'),
+                              'digest':before.get('digest'),'status':'accepted'} and
+                 after_row=={'id':target,'revision':after.get('revision'),
+                             'digest':after.get('digest'),'status':'accepted'},
+                 'invalid_snapshot','Sequential material artifact pins differ from the proof')
+            archived=artifacts.get(target)
+            before_revision=revisions.get((target,before.get('revision')))
+            after_revision=revisions.get((target,after.get('revision')))
+            need(archived is not None and archived.get('kind')==after.get('kind') and
+                 before_revision is not None and before_revision.get('digest')==before.get('digest') and
+                 canonical(before_revision.get('body'))==canonical(before.get('body')) and
+                 after_revision is not None and after_revision.get('status')=='accepted' and
+                 after_revision.get('digest')==after.get('digest') and
+                 canonical(after_revision.get('body'))==canonical(after.get('body')),
+                 'invalid_snapshot','Sequential prior artifact transition differs from archived revision history')
+        # Reconstruct the exact bounded transition offline. Only earlier
+        # decision status and their event-proven artifact snapshots may differ
+        # from the full review packet; the linked-change packet may differ only
+        # at those same controller-pinned artifact rows.
+        normalized=copy.deepcopy(current_material)
+        normalized_other={item.get('id'):item for item in normalized.get('other_decisions',[])
+                          if isinstance(item,dict)}
+        for effect in applied:
+            prior_id=effect['decision'];old=base_other[prior_id];now=normalized_other.get(prior_id)
+            need(now is not None and now.get('status')=='applied' and
+                 canonical({key:value for key,value in now.items() if key!='status'})==
+                 canonical({key:value for key,value in old.items() if key!='status'}),
+                 'invalid_snapshot','Sequential decision material has unrelated other-decision drift')
+            normalized_other[prior_id]=old
+        normalized['other_decisions']=sorted(normalized_other.values(),key=lambda item:item.get('id',''))
+        normalized_rows={item.get('id'):item for item in normalized.get('current_artifacts',[])
+                         if isinstance(item,dict)}
+        base_rows={item.get('id'):item for item in base_material.get('current_artifacts',[])
+                   if isinstance(item,dict)}
+        for effect in applied:
+            target=effect.get('target')
+            if target is None: continue
+            old=base_rows.get(target);now=normalized_rows.get(target)
+            need(old=={'id':target,'revision':effect['before']['revision'],
+                       'digest':effect['before']['digest'],'status':'accepted'} and
+                 now=={'id':target,'revision':effect['after']['revision'],
+                       'digest':effect['after']['digest'],'status':'accepted'},
+                 'invalid_snapshot','Sequential material artifact differs beyond its applied revision')
+            normalized_rows[target]=old
+        normalized['current_artifacts']=sorted(normalized_rows.values(),key=lambda item:item.get('id',''))
+        target_effects={effect['target']:effect for effect in applied if effect.get('target') is not None}
+        base_link=base_material.get('linked_change');current_link=normalized.get('linked_change')
+        if base_link or current_link:
+            need(isinstance(base_link,dict) and isinstance(current_link,dict) and
+                 base_link.get('id')==current_link.get('id') and
+                 base_link.get('revision')==current_link.get('revision') and
+                 base_link.get('binding')==base_material.get('proposal',{}).get('change_binding') and
+                 isinstance(base_link.get('material'),dict) and isinstance(current_link.get('material'),dict),
+                 'invalid_snapshot','Sequential linked-change material is externalized or changed')
+            current_change=copy.deepcopy(current_link['material']);base_change=base_link['material']
+            def normalize_pin_list(rows,old_rows,*,full):
+                if not isinstance(rows,list) or not isinstance(old_rows,list):
+                    need(rows==old_rows,'invalid_snapshot','Sequential linked artifact pin list is malformed')
+                    return
+                old_by={item.get('id'):item for item in old_rows if isinstance(item,dict)}
+                for index,item in enumerate(rows):
+                    if not isinstance(item,dict) or item.get('id') not in target_effects: continue
+                    effect=target_effects[item['id']];old=old_by.get(item['id'])
+                    expected_new=effect['after'] if full else {
+                        'id':item['id'],'revision':effect['after']['revision'],
+                        'digest':effect['after']['digest']}
+                    expected_old=effect['before'] if full else {
+                        'id':item['id'],'revision':effect['before']['revision'],
+                        'digest':effect['before']['digest']}
+                    need(item==expected_new and old==expected_old,
+                         'invalid_snapshot','Sequential linked-change pins differ from the applied effect')
+                    rows[index]=old
+            normalize_pin_list(current_change.get('current'),base_change.get('current'),full=False)
+            for holder_name in ('upper_contracts',):
+                holder=current_change.get(holder_name);old_holder=base_change.get(holder_name)
+                if isinstance(holder,dict) or isinstance(old_holder,dict):
+                    need(isinstance(holder,dict) and isinstance(old_holder,dict),
+                         'invalid_snapshot','Sequential upper-contract packet changed')
+                    normalize_pin_list(holder.get('artifacts'),old_holder.get('artifacts'),full=True)
+            current_scope=current_change.get('scope_review');old_scope=base_change.get('scope_review')
+            if isinstance(current_scope,dict) or isinstance(old_scope,dict):
+                need(isinstance(current_scope,dict) and isinstance(old_scope,dict),
+                     'invalid_snapshot','Sequential scope packet changed')
+                holder=current_scope.get('upper_contracts');old_holder=old_scope.get('upper_contracts')
+                if isinstance(holder,dict) or isinstance(old_holder,dict):
+                    need(isinstance(holder,dict) and isinstance(old_holder,dict),
+                         'invalid_snapshot','Sequential scope upper-contract packet changed')
+                    normalize_pin_list(holder.get('artifacts'),old_holder.get('artifacts'),full=True)
+            need(canonical(current_change)==canonical(base_change),
+                 'invalid_snapshot','Linked-change material has unrelated sequential drift')
+            normalized['linked_change']=copy.deepcopy(base_link)
+        need(canonical(normalized)==canonical(base_material),
+             'invalid_snapshot','Sequential proof does not reconstruct the full-review packet')
     need(len({r['id'] for r in spec['attempts']})==len(spec['attempts']),'invalid_snapshot','Duplicate attempt IDs')
     for attempt in spec['attempts']:
         need(attempt['change_id'] in registries['changes'],'invalid_snapshot','Attempt has no change')
@@ -538,6 +794,7 @@ def _validate_specifications(spec, *, include_projection=False):
             'documents':len(documents),'decisions':len(spec['decisions']),'changes':len(spec['changes']),
             'decision_batches':len(decision_batches),
             'decision_incremental_reviews':len(incremental_reviews),
+            'decision_apply_incremental_reviews':len(decision_apply_reviews),
             **local_counts}
     return {'counts':counts,**source_projection} if include_projection else counts
 
@@ -710,6 +967,11 @@ class KnowledgeHistory:
                  'created':r['created'],'body':parse_json(r['body'])}
                 for r in self.s.all("SELECT id,seq,project,actor,created,body FROM events WHERE project=? "
                     "AND kind='decision_incremental_review_applied' ORDER BY seq,id",(project,))]
+            spec['decision_apply_incremental_reviews']=[
+                {'id':r['id'],'seq':r['seq'],'project':r['project'],'actor':r['actor'],
+                 'created':r['created'],'body':parse_json(r['body'])}
+                for r in self.s.all("SELECT id,seq,project,actor,created,body FROM events WHERE project=? "
+                    "AND kind='decision_apply_incremental_review_applied' ORDER BY seq,id",(project,))]
             programs=[decoded(r) for r in self.s.all('SELECT * FROM programs WHERE project=? ORDER BY id',(project,))]
             origin_rows=[decoded(r) for r in self.s.all('SELECT * FROM program_origins WHERE project=? ORDER BY program',(project,))]
             validate_origin_rows(programs, origin_rows, project, code='invalid_snapshot')

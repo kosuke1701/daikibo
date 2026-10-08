@@ -20,6 +20,7 @@ from daikibo.assurance_additive import (
 from daikibo.assurance_denominators import collect_stage_context, derive_denominator
 from daikibo.common import Fault, canonical, digest, timestamp
 from daikibo.knowledge import Knowledge
+from conftest import route_change_to_product
 
 
 def _domain(full, project, name="Weather domain"):
@@ -158,14 +159,18 @@ def test_formal_change_can_remove_a_declaration_and_preserve_history(full):
         "affected": [design["id"]], "evidence": [source["id"]],
         "deltas": [{"artifact": design["id"], "expected_revision": 1, "body": changed_body}],
     })
-    feasibility = full.rt.review(full.owner, change["id"], "feasibility", "fixture")
-    full.p.attempt(full.owner, change["id"], "local_repair", {
-        "hypothesis": "Apply the reviewed design body",
-        "alternatives": ["retain the declaration"], "evidence": [feasibility["receipt"]],
-        "outcome": "solution", "remaining_unknown": "",
+    assert route_change_to_product(full, change["id"]) == "awaiting_product_decision"
+    decision = full.p.propose_decision(full.owner, project, {
+        "title": "Adopt the declaration-free design",
+        "reason": "The reviewed design no longer carries the obsolete declaration.",
+        "options": ["approve", "keep_existing"], "recommendation": "approve",
+        "refs": [design["id"]], "requirement_affecting": True,
+        "change": change["id"],
     })
-    consistency = full.rt.review(full.owner, change["id"], "consistency", "fixture")
-    full.p.apply_technical_change(full.owner, change["id"], consistency["receipt"])
+    full.p.respond(full.owner, decision["id"], decision["digest"], "approve",
+                   "Approve the exact reviewed design update")
+    consistency = full.rt.review(full.owner, decision["id"], "consistency", "fixture")
+    full.p.apply_decision(full.owner, decision["id"], consistency["receipt"])
     current = full.k.artifact(full.owner, design["id"])
     historical = full.k.artifact(full.owner, design["id"], 1)
     assert "structural_obligations" not in current["body"]

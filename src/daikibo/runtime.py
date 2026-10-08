@@ -783,9 +783,10 @@ class Runtime:
         decision=self.s.one("SELECT * FROM decisions WHERE id=?",(subject,))
         if decision:
             self.k.project(actor,decision['project'])
-            project,material=self.p.decision_review_material(subject)
             base_receipt=(proposal.get('incremental_from')
                           if isinstance(proposal,dict) else None)
+            project,material=self.p.decision_review_material(subject,
+                allow_stale_linked_change=base_receipt is not None)
             if base_receipt is not None:
                 need(set(proposal)=={'incremental_from'} and isinstance(base_receipt,str),
                      'invalid_proposal','Incremental review proposal must contain only incremental_from')
@@ -1342,9 +1343,46 @@ class Runtime:
                 'one requirement; verify the exact artifact/source digests and whether the addition creates a contradiction or '
                 'changes any prior conclusion. If the proof or available material does not establish that, return blocked/fail '
                 'so the caller can obtain a full review. Cover every decision-incremental marker only after assessing the delta.')
+        if context.get('format')=='decision-apply-incremental-review.v1':
+            instructions += (' This is a bounded sequential-apply supplemental consistency review. Treat the carried latest full PASS '
+                'as the review of the unchanged base proposal, authenticated answer, source, policy, invariants and linked change; '
+                'do not repeat that full review. Assess every listed, event-proven prior individual decision effect against the '
+                'current decision: compare exact before/after artifacts when present, account for record-only decisions as status '
+                'changes without artifact edits, and determine whether those outcomes change this proposal’s selected effect, '
+                'constraints, dependencies, expected final state, or any conclusion in the base PASS. Do not assume distinct artifact '
+                'targets are independent. Inspect the supplied proof and current material, including any linked-change scope packet, '
+                'and block if a prior effect, relevant interaction, or required material is unclear. Cover each '
+                'decision-apply-prior:<decision> and decision-apply-artifact:<artifact> marker only after assessing its exact effect; '
+                'these markers are not approval of implementation success.')
         if 'change_material' in context and context.get('required_coverage'):
             instructions += (' A display-metadata-equivalence repair includes its complete canonical before/after bodies and exact evidence. '
                 'For an external change-material marker, read change.read with the advertised digest through every page before marking coverage.')
+        def has_change_scope(value):
+            if isinstance(value,dict):
+                if isinstance(value.get('scope_review'),dict) and value['scope_review'].get('format')=='change-scope-review.v1':
+                    return True
+                markers=value.get('required_coverage',[])
+                if isinstance(markers,list) and any(isinstance(marker,str) and
+                        marker.startswith(('scope:','target:','effect:','carry:','consumer:','unknown-neighbor:'))
+                        for marker in markers):
+                    return True
+                return any(has_change_scope(child) for child in value.values())
+            if isinstance(value,list):
+                return any(has_change_scope(child) for child in value)
+            return False
+        if has_change_scope(context):
+            instructions += (' Change scope packets contain controller-generated typed dispositions. Return one disposition '
+                'with the exact supplied id and one allowed resolution for every scope_review.required_dispositions item; '
+                'include a specific reason and cover each exact marker. Use within_scope only when the proposal fits the '
+                'current layer and every protected upper contract remains unchanged; its target_layer must equal the current '
+                'layer. Use upper_scope_required for a needed parent-layer or product decision and name the closest authorized '
+                'higher target layer supported by the evidence; unresolved when evidence or consumer discovery is incomplete '
+                'and its target_layer must remain the current layer. '
+                'Use preserves_meaning only after comparing the complete before/after artifact and exact source; cite that '
+                'artifact in an observation. Use within_current_contract only with the supplied asserted path and current '
+                'upper-contract pins. An unaffected carry candidate is only a claim for controller revalidation and must not '
+                'be used to imply that a changed artifact already has a new review. The controller stops unknown neighbors '
+                'and will not accept reviewer self-report as discovery. Never reuse or invent disposition IDs or resolution values.')
         if role == 'domain_responsibility':
             instructions = ('Independently review the current accepted DOMAIN in context.domain_review. '
                 'Assess source fidelity, every responsibility, omissions, duplicates, contradictions, non_responsibilities boundaries, '

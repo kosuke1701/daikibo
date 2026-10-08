@@ -373,6 +373,28 @@ def full_project(full,tmp_path):
     return pid,rid,req['id'],root
 
 
+def route_change_to_product(control,change,adapter='fixture'):
+    """Reach product adjudication through the public typed review/attempt path."""
+    for _ in range(3):
+        stage=control.s.one('SELECT stage FROM changes WHERE id=?',(change,),True)['stage']
+        if stage=='awaiting_product_decision':
+            return stage
+        review=control.rt.review(control.owner,change,'consistency',adapter)
+        scope=next((item.get('resolution') for item in review['result'].get('dispositions',[])
+                    if item.get('id')=='scope:'+change),None)
+        if scope=='upper_scope_required':
+            receipt=review['receipt'];outcome='scope_exceeded'
+        else:
+            review=control.rt.review(control.owner,change,'feasibility',adapter)
+            receipt=review['receipt'];outcome='no_solution_found'
+        control.p.attempt(control.owner,change,stage,{
+            'hypothesis':'Exercise the independently reviewed test route.',
+            'alternatives':['Keep the current change scope.'],'evidence':[receipt],
+            'outcome':outcome,'remaining_unknown':'None in this deterministic test fixture.',
+            'review_receipt':receipt})
+    return control.s.one('SELECT stage FROM changes WHERE id=?',(change,),True)['stage']
+
+
 def make_task(c,project,goal=None,paths=None,deps=None):
     import json
     pid,rid,req,_=project

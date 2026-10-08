@@ -18,10 +18,50 @@ if p['role'] == 'delivery_profile':
     bad |= bool(previous and json.loads(previous['body'])['target_environment'] == 'New baseline')
 elif 'change' in c or p['role'] == 'decision_proposal':
     bad |= any(a['statement'] == 'New constraint' for a in c.get('invariants', []))
+scope_packets=[]
+def walk(value):
+    if isinstance(value, dict):
+        scope=value.get('scope_review')
+        if isinstance(scope, dict) and scope.get('format') == 'change-scope-review.v1':
+            scope_packets.append((value, scope))
+        for child in value.values(): walk(child)
+    elif isinstance(value, list):
+        for child in value: walk(child)
+walk(c)
+dispositions=[]
+for material, scope in scope_packets:
+    after_by={item.get('artifact'):item for item in material.get('before_after', [])}
+    effects={}
+    for item in scope.get('required_dispositions', []):
+        if item.get('kind') != 'delta_effect': continue
+        artifact=item['subject']; detail=after_by.get(artifact, {})
+        before=detail.get('before', {}).get('body', {}); after=detail.get('after', {}).get('body', {})
+        changed={key for key in set(before)|set(after) if before.get(key) != after.get(key)}
+        if not changed or changed <= {'title'}:
+            effects[artifact]='preserves_meaning'
+        elif detail.get('kind') in {'design','component','test'} and any(
+                path.get('root') == artifact for path in scope.get('upper_contracts', {}).get('upper_paths', [])):
+            effects[artifact]='within_current_contract'
+        else:
+            effects[artifact]='changes_upper_contract'
+    needs_upper=any(value in {'changes_upper_contract','unknown'} for value in effects.values())
+    layer_scope='upper_scope_required' if needs_upper else 'within_scope'
+    target='awaiting_product_decision' if needs_upper else scope.get('layer','local_repair')
+    for item in scope.get('required_dispositions', []):
+        kind=item.get('kind'); marker=item['id']
+        if kind == 'layer_scope': resolution=layer_scope
+        elif kind == 'layer_target': resolution=target
+        elif kind == 'delta_effect': resolution=effects[item['subject']]
+        elif kind == 'review_carry_and_task_fence': resolution='affected'
+        elif kind == 'interface_consumer': resolution='addressed'
+        elif kind == 'declared_unknown_consumer': resolution='unresolved'
+        else: continue
+        dispositions.append({'id':marker,'resolution':resolution,
+                             'reason':'Finite test fixture reviewed the exact typed scope.'})
 print(json.dumps({'verdict': 'fail' if bad else 'pass', 'rationale': 'Finite test fixture',
  'covered': c.get('required_coverage', []), 'findings': [],
  'observations': [{'ref': p['subject'], 'detail': 'Observed current review material'}],
- 'dispositions': []}))
+ 'dispositions': dispositions}))
 '''
 
 
@@ -87,8 +127,10 @@ def test_technical_change_requires_current_invariants(full, full_project, tmp_pa
     policy = c.k.propose(c.owner, p, 'design', {'title': 'Constraint',
         'statement': 'Old constraint', 'critical': True})
     c.k.accept(c.owner, policy['id'], 1)
+    c.k.link(c.owner,policy['id'],full_project[2],'realizes','asserted','Constraint governs this requirement')
     design = c.k.propose(c.owner, p, 'design', {'title': 'Design', 'statement': 'Old design'})
     c.k.accept(c.owner, design['id'], 1)
+    c.k.link(c.owner,design['id'],full_project[2],'realizes','asserted','Design realizes this requirement')
     seed = c.rt.review(c.owner, design['id'], 'design', 'material-pass')['receipt']
     change = technical_change(c, p, design, seed, 'Updated design')
     old = c.rt.review(c.owner, change, 'consistency', 'material-pass')
@@ -146,6 +188,7 @@ def test_provisional_decision_requires_current_invariants(full, full_project, tm
     policy = c.k.propose(c.owner, p, 'design', {'title': 'Constraint',
         'statement': 'Old constraint', 'critical': True})
     c.k.accept(c.owner, policy['id'], 1)
+    c.k.link(c.owner,policy['id'],requirement,'realizes','asserted','Constraint governs this requirement')
     proposed = provisional_proposal(requirement)
     old = c.rt.review(c.owner, p, 'decision_proposal', 'material-pass', proposal=proposed)
     change = technical_change(c, p, policy, old['receipt'], 'New constraint')

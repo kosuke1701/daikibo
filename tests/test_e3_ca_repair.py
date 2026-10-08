@@ -6,6 +6,7 @@ import pytest
 
 from daikibo.assurance import validate_assurance_rows
 from daikibo.common import Fault, canonical, digest, parse_json
+from conftest import route_change_to_product
 
 from test_e3_selection_contract import (
     _adopt,
@@ -324,6 +325,9 @@ def _applied_change_authority_fixture(full, *, withdraw=False, adopt_initial=Fal
             "deltas": [delta],
         },
     )
+    assert route_change_to_product(
+        full, change["id"], adapter="e3-assurance-fixture"
+    ) == "awaiting_product_decision"
     decision = full.p.propose_decision(
         full.owner,
         project,

@@ -187,26 +187,61 @@ class Planning:
             need(source['project']==project and source['trust']=='human','human_input_required','Untrusted text cannot impersonate a new user instruction')
         for evidence in body['evidence']:
             need(self.s.one("SELECT id FROM sources WHERE id=? AND project=?",(evidence,project)) or self.s.one("SELECT id FROM receipts WHERE id=? AND project=?",(evidence,project)) or self.s.one("SELECT id FROM artifacts WHERE id=? AND project=? AND kind IN ('finding','risk','unknown')",(evidence,project)), 'missing_evidence','Change evidence does not exist')
-        impact=self.k.impact(actor,project,body['affected'])
+        self.validate_deltas(actor,project,body.get('deltas',[]))
+        roots=self._change_roots(body)
+        impact=self.k.impact(actor,project,roots)
         unknown=strings(body.get('unknown_neighbors',[]),'unknown_neighbors')
         for t in unknown: self.s.one("SELECT id FROM tasks WHERE id=? AND project=?",(t,project),True)
-        body={**body,'impact':impact,'baseline_refs':[{k:a[k] for k in ('id','revision','digest')} for a in [self.k.artifact(actor,x) for x in body['affected']]]}
-        self.validate_deltas(actor,project,body.get('deltas',[]))
-        repair_candidate=(body['origin']=='user' and body.get('source') and body.get('deltas') and
-                          all(self._is_display_metadata_repair(self.k.artifact(actor,d['artifact']),d)
-                              for d in body['deltas']))
-        ident=uid('CHG');stage='local_repair' if body['origin']!='user' or repair_candidate else 'awaiting_product_decision'
+        refs=[]
+        for artifact_id in roots:
+            artifact=self.k.artifact(actor,artifact_id)
+            refs.append({k:artifact[k] for k in ('id','revision','digest')})
+        body={**body,'impact':impact,'impact_roots':roots,'baseline_refs':refs,
+              'scope_layer':'local_repair'}
+        no_effect=self._change_has_no_effect(actor,project,body,body.get('deltas',[]))
+        body['no_effect']=no_effect
+        ident=uid('CHG')
+        # Origin records provenance and may provide a trusted source. It is not
+        # a substitute for the independent layer disposition.
+        stage='local_repair'
         with self.s.transaction():
-            task_fence=self._capture_keep_existing_task_fence(project,ident,impact,set(unknown))
+            task_fence=({'format':'keep-existing-task-fence.v1','change':ident,
+                         'candidates':{},'scope':'no_effect'} if no_effect else
+                self._capture_keep_existing_task_fence(project,ident,impact,set(unknown)))
             self.s.execute("INSERT INTO changes VALUES(?,?,?,?,?,?)",(ident,project,stage,canonical(body).decode(),1,timestamp()))
-            for t in set(impact['tasks']) | set(unknown):
-                self.s.execute("INSERT OR REPLACE INTO blocks VALUES(?,?,?,?)",(t,'change',ident,body['reason']))
-                self.s.execute("UPDATE tasks SET validity='needs_review',epoch=epoch+1,lease_until=NULL,updated=? WHERE id=?",(timestamp(),t))
+            if not no_effect:
+                for t in set(impact['tasks']) | set(unknown):
+                    self.s.execute("INSERT OR REPLACE INTO blocks VALUES(?,?,?,?)",(t,'change',ident,body['reason']))
+                    self.s.execute("UPDATE tasks SET validity='needs_review',epoch=epoch+1,lease_until=NULL,updated=? WHERE id=?",(timestamp(),t))
             self.sec.event(project,'change_registered',actor.id,{'id':ident,'stage':stage,'impact':impact,
-                'task_fence':task_fence})
-            if stage=='awaiting_product_decision': self._publish_change_notice(project,ident,body)
+                'task_fence':task_fence,'no_effect':no_effect})
+            if no_effect:
+                self.sec.event(project,'change_no_effect_observed',actor.id,{'change':ident,
+                    'origin':body['origin'],'source':body.get('source'),'request_fulfilled':False,
+                    'delta_targets':sorted(item['artifact'] for item in body.get('deltas',[]))})
             binding=self.change_binding(ident)
-        return {'id':ident,'stage':stage,'impact':impact,'binding':binding}
+        return {'id':ident,'stage':stage,'impact':impact,'binding':binding,'no_effect':no_effect}
+
+    @staticmethod
+    def _change_roots(body):
+        return sorted(set(body.get('affected',[])) | {
+            delta['artifact'] for delta in body.get('deltas',[])
+            if isinstance(delta,dict) and isinstance(delta.get('artifact'),str)
+        })
+
+    def _change_fence_candidates(self,project,change,impact):
+        """Rebuild the controller-observed set of untouched planned tasks."""
+        events=self.s.all("SELECT body FROM events WHERE project=? AND kind IN "
+            "('change_registered','change_impact_recalculated') "
+            "AND json_extract(body,'$.id')=? ORDER BY seq",(project,change))
+        candidates={}
+        for event in events:
+            fence=parse_json(event['body']).get('task_fence',{})
+            if fence.get('format')!='keep-existing-task-fence.v1' or fence.get('scope')!='planned_unstarted_only':
+                continue
+            candidates.update(fence.get('candidates',{}))
+        current=set(impact.get('tasks',[]))
+        return {task:value for task,value in candidates.items() if task in current}
 
     def _capture_keep_existing_task_fence(self,project,change,impact,unknown):
         """Retain controller-observed pre-change state for a narrow no-work fence."""
@@ -243,6 +278,46 @@ class Planning:
             material['scope']='proof_exceeds_bound'
         return material
 
+    def _restore_no_effect_task_fences(self,actor,project,change,body,impact):
+        """Revalidate only pre-fenced, still-unstarted tasks after a delta becomes empty."""
+        candidates=self._change_fence_candidates(project,change,impact)
+        restored=[]
+        for task,before in candidates.items():
+            row=self.s.one('SELECT * FROM tasks WHERE id=? AND project=?',(task,project))
+            if row is None:continue
+            blocks=self.s.all('SELECT kind,ref,reason FROM blocks WHERE task=? ORDER BY kind,ref',(task,))
+            expected_block=[{'kind':'change','ref':change,'reason':body.get('reason')}]
+            if (row['status']!='planned' or row['validity']!='needs_review' or
+                    row['revision']!=before['revision'] or row['epoch']!=before['epoch']+1 or
+                    row['candidate'] is not None or row['lease_owner'] is not None or
+                    row['lease_until'] is not None or row['paused'] or
+                    digest(row['body'].encode())!=before['task_body_digest'] or
+                    canonical(blocks)!=canonical(expected_block) or
+                    canonical(self.s.all('SELECT artifact,revision,digest FROM task_reads WHERE task=? ORDER BY artifact',(task,)))!=canonical(before['reads']) or
+                    self.s.one('SELECT task FROM plans WHERE task=?',(task,)) is not None or
+                    self.s.one('SELECT 1 FROM runs WHERE task=? LIMIT 1',(task,)) is not None or
+                    self.s.one('SELECT 1 FROM candidates WHERE task=? LIMIT 1',(task,)) is not None or
+                    self.s.one('SELECT 1 FROM execution_attempts WHERE task=? LIMIT 1',(task,)) is not None or
+                    self.s.one('SELECT 1 FROM local_execution_records WHERE task=? LIMIT 1',(task,)) is not None):
+                continue
+            pins_current=True
+            for pin in before['reads']:
+                current=self.s.one('SELECT project,revision,digest,status FROM artifacts WHERE id=?',(pin['artifact'],))
+                if (current is None or current['project']!=project or current['status']!='accepted' or
+                        current['revision']!=pin['revision'] or current['digest']!=pin['digest']):
+                    pins_current=False;break
+            if not pins_current:continue
+            cursor=self.s.execute("UPDATE tasks SET validity='current',updated=? WHERE id=? AND project=? "
+                "AND status='planned' AND validity='needs_review' AND revision=? AND epoch=?",
+                (timestamp(),task,project,before['revision'],before['epoch']+1))
+            need(cursor.rowcount==1,'stale_task','Task changed during no-effect revalidation',task)
+            proof={'task':task,'change':change,'before_epoch':before['epoch'],
+                   'current_epoch':before['epoch']+1,'task_body_digest':before['task_body_digest'],
+                   'read_pins_digest':digest(before['reads']),'reason':'exact_delta_has_no_effect'}
+            self.sec.event(project,'task_revalidated_after_no_effect_change',actor.id,proof)
+            restored.append(proof)
+        return sorted(restored,key=lambda item:item['task'])
+
     def _keep_existing_task_revalidations(self,project,change,decision,*,apply=False,expected=None,actor='system'):
         """Prove the same narrow task-fence conditions before and after decline."""
         registration=self.s.one("SELECT body FROM events WHERE project=? AND kind='change_registered' "
@@ -257,7 +332,8 @@ class Planning:
         change_row=self.s.one('SELECT * FROM changes WHERE id=? AND project=?',(change,project))
         expected_status='applied' if apply else 'decision_received'
         expected_change_stage='withdrawn' if apply else 'awaiting_product_decision'
-        expected_change_revision=2 if apply else 1
+        attempts=self.s.one('SELECT count(*) AS n FROM attempts WHERE change_id=?',(change,))['n']
+        expected_change_revision=1+attempts+(1 if apply else 0)
         if (not decision_row or not change_row or change_row['stage']!=expected_change_stage or
                 change_row['revision']!=expected_change_revision):
             return []
@@ -267,6 +343,7 @@ class Planning:
                 decision_body.get('change')!=change or
                 set(decision_body.get('refs',[]))!=set(change_body.get('affected',[])) or
                 change_body.get('unknown_neighbors') or
+                change_body.get('delta_history') or
                 (apply and change_body.get('withdrawal',{}).get('decision')!=decision)):
             return []
         registered=parse_json(registration['body'])
@@ -361,6 +438,26 @@ class Planning:
 
         return ids
 
+    def _change_has_no_effect(self,actor,project,body,deltas=None):
+        deltas=body.get('deltas',[]) if deltas is None else deltas
+        if (not isinstance(deltas,list) or not deltas or body.get('unknown_neighbors') or
+                not isinstance(body.get('affected'),list) or
+                len(set(body['affected']))!=len(body['affected'])):
+            return False
+        targets=[]
+        for delta in deltas:
+            if not isinstance(delta,dict) or type(delta.get('withdraw',False)) is not bool or delta.get('withdraw'):
+                return False
+            target=delta.get('artifact')
+            if not isinstance(target,str):return False
+            current=self.k.artifact(actor,target)
+            if (current['project']!=project or current['status']!='accepted' or
+                    current['revision']!=delta.get('expected_revision') or
+                    canonical(current['body'])!=canonical(delta.get('body'))):
+                return False
+            targets.append(target)
+        return len(set(targets))==len(targets) and set(targets)==set(body['affected'])
+
     @staticmethod
     def _is_display_metadata_repair(artifact,delta):
         """Recognize a candidate title-only edit; this is not a semantic verdict."""
@@ -373,6 +470,29 @@ class Planning:
             return False
         return canonical({k:v for k,v in before.items() if k!='title'})==canonical(
             {k:v for k,v in after.items() if k!='title'})
+
+    @staticmethod
+    def _is_editorial_repair_candidate(artifact,delta):
+        """Recognize text-edit candidates; independent review decides equivalence."""
+        if (artifact['status']!='accepted' or not isinstance(delta,dict) or delta.get('withdraw') or
+                not isinstance(delta.get('body'),dict)):
+            return False
+        before=artifact['body'];after=delta['body']
+        if set(before)!=set(after):
+            return False
+        changed=[key for key in before if canonical(before[key])!=canonical(after[key])]
+        return bool(changed) and all(key in {'title','statement','description','summary','label','name'} and
+                                     isinstance(before[key],str) and isinstance(after[key],str)
+                                     for key in changed)
+
+    def _is_user_editorial_repair(self,actor,project,body):
+        if body.get('origin')!='user' or not body.get('source') or not body.get('deltas'):
+            return False
+        source=self.s.one('SELECT project,trust FROM sources WHERE id=?',(body['source'],))
+        if source is None or source['project']!=project or source['trust']!='human':
+            return False
+        return all(self._is_editorial_repair_candidate(self.k.artifact(actor,item['artifact']),item)
+                   for item in body['deltas'])
 
     def _validate_display_metadata_repair(self,actor,change,artifact,delta):
         need(self._is_display_metadata_repair(artifact,delta),'product_decision_required',
@@ -390,6 +510,120 @@ class Planning:
         need(marker in material.get('required_coverage',[]),'repair_review_required',
              'The current change material does not require an explicit metadata-equivalence assessment')
 
+    def _change_upper_contract_context(self,project,roots):
+        """Bind a bounded bidirectional artifact neighborhood around the change."""
+        seen=set(roots);frontier=set(roots);links={};artifacts={};upper_paths=[]
+        bounded=True;max_hops=8;max_nodes=1000;max_links=5000
+        for _ in range(max_hops):
+            if not frontier:break
+            ids=sorted(frontier);placeholders=','.join('?' for _ in ids)
+            remaining=max_links-len(links)
+            if remaining<=0:
+                bounded=False;break
+            rows=self.s.all(f"SELECT source,target,relation,confidence,basis FROM links "
+                f"WHERE source IN ({placeholders}) OR target IN ({placeholders}) "
+                "ORDER BY source,target,relation LIMIT ?",(*ids,*ids,remaining+1))
+            if len(rows)>remaining:
+                rows=rows[:remaining];bounded=False
+            next_nodes=set()
+            for link in rows:
+                links[canonical(link).decode()]=link
+                next_nodes.update((link['source'],link['target']))
+            frontier=set()
+            for ident in next_nodes-seen:
+                row=self.s.one('SELECT id,project FROM artifacts WHERE id=?',(ident,))
+                if row is None or row['project']!=project:
+                    continue
+                seen.add(ident);frontier.add(ident)
+            if len(seen)>max_nodes or len(links)>max_links:
+                bounded=False;break
+        if frontier:
+            bounded=False
+        for ident in sorted(seen):
+            row=self.s.one('SELECT id,project,revision,digest,status,kind,body FROM artifacts WHERE id=?',(ident,))
+            if row is None or row['project']!=project:
+                continue
+            artifacts[ident]={**row,'body':parse_json(row['body'])}
+        # A nearby requirement is not a parent contract unless an asserted
+        # relation records that exact direction and relationship.
+        path_frontier=[(root,root,[]) for root in sorted(roots)];path_seen=set()
+        for _ in range(max_hops):
+            next_frontier=[]
+            for current,origin,path in path_frontier:
+                current_row=artifacts.get(current)
+                if current_row is None:
+                    continue
+                remaining_paths=max_links-len(upper_paths)
+                if remaining_paths<=0:
+                    bounded=False;break
+                if current_row['kind']=='requirement':
+                    parents=self.s.all("SELECT source AS parent,source,target,relation,confidence,basis FROM links "
+                        "WHERE target=? AND relation='decomposes' AND confidence='asserted' ORDER BY source LIMIT ?",
+                        (current,remaining_paths+1))
+                else:
+                    parents=self.s.all("SELECT target AS parent,source,target,relation,confidence,basis FROM links "
+                        "WHERE source=? AND relation IN ('realizes','derived_from','supersedes') "
+                        "AND confidence='asserted' ORDER BY target,relation LIMIT ?",(current,remaining_paths+1))
+                if len(parents)>remaining_paths:
+                    parents=parents[:remaining_paths];bounded=False
+                for edge in parents:
+                    parent=edge['parent']
+                    key=(origin,parent,edge['relation'])
+                    if parent==current or key in path_seen:
+                        continue
+                    walk_nodes=[origin]+[step.get('walk_to') for step in path]
+                    if parent in walk_nodes:
+                        bounded=False
+                        continue
+                    path_seen.add(key)
+                    item={'from':edge['source'],'relation':edge['relation'],'to':edge['target'],
+                          'confidence':edge['confidence'],'basis':edge['basis'],
+                          'walk_from':current,'walk_to':parent}
+                    next_path=path+[item]
+                    upper_paths.append({'root':origin,'path':next_path,'upper':parent})
+                    next_frontier.append((parent,origin,next_path))
+            path_frontier=next_frontier
+            if not path_frontier:
+                break
+        if path_frontier:
+            bounded=False
+        return {'format':'change-upper-contract-pins.v1','roots':sorted(roots),
+            'max_hops':max_hops,'bounded':bounded,
+            'artifacts':[artifacts[key] for key in sorted(artifacts)],
+            'links':[links[key] for key in sorted(links)],'upper_paths':upper_paths}
+
+    def _change_scope_review(self,change,stage,body,project,impact,upper_contracts,interface_impacts):
+        candidates=self._change_fence_candidates(project,change,impact)
+        dispositions=[{'id':'scope:'+change,'kind':'layer_scope','subject':change,
+                       'allowed':['within_scope','upper_scope_required','unresolved']},
+                      {'id':'target:'+change,'kind':'layer_target','subject':change,
+                       'allowed':['local_repair','module_replan','system_replan','awaiting_product_decision']}]
+        for delta in body.get('deltas',[]):
+            dispositions.append({'id':'effect:'+delta['artifact'],'kind':'delta_effect',
+                'subject':delta['artifact'],'allowed':['preserves_meaning','within_current_contract',
+                                                       'changes_upper_contract','unknown']})
+        for task in sorted(candidates):
+            dispositions.append({'id':'carry:'+task,'kind':'review_carry_and_task_fence',
+                'subject':task,'allowed':['unaffected','affected','unknown'],
+                'note':'unaffected is only a candidate; controller pin/fence checks are still required'})
+        for interface in interface_impacts:
+            names=set(interface.get('declared_consumers',[]))
+            names.update(item.get('source') for item in interface.get('registered_consumer_links',[])
+                         if isinstance(item.get('source'),str))
+            for name in sorted(names):
+                marker='consumer:'+interface['interface']+':'+digest(name)[:16]
+                dispositions.append({'id':marker,'kind':'interface_consumer','subject':interface['interface'],
+                                     'consumer':name,'allowed':['addressed','unknown']})
+        for task in sorted(set(body.get('unknown_neighbors',[]))):
+            dispositions.append({'id':'unknown-neighbor:'+task,'kind':'declared_unknown_consumer',
+                                 'subject':task,'allowed':['addressed','unresolved']})
+        return {'format':'change-scope-review.v1','layer':body.get('scope_layer',stage),
+            'target_layers':['local_repair','module_replan','system_replan','awaiting_product_decision'],
+            'required_dispositions':dispositions,'impact':impact,
+            'upper_contracts':upper_contracts,
+            'known_interface_consumers':interface_impacts,
+            'unknown_neighbors':body.get('unknown_neighbors',[])}
+
     def change_review_material(self, change):
         """Return one consistent view used both by the prompt and by its binding."""
         from .contracts import interface_impact_context
@@ -399,6 +633,10 @@ class Planning:
             body=parse_json(row['body'])
             before_after=[]
             required_coverage=[]
+            roots=self._change_roots(body)
+            current_impact=self.k.impact(Actor('system','owner'),row['project'],roots)
+            current_refs=[{k:a[k] for k in ('id','revision','digest')}
+                          for a in [self.k.artifact(Actor('system','owner'),x) for x in roots]]
             for delta in body.get('deltas',[]):
                 current=self.k.artifact(Actor('system','owner'),delta['artifact'])
                 historical=self.k.artifact(Actor('system','owner'),delta['artifact'],delta['expected_revision'])
@@ -409,6 +647,7 @@ class Planning:
                     'before':{'revision':historical['revision'],'digest':historical['digest'],
                               'status':historical['status'],'body':historical['body']},
                     'after':{'body':delta['body'],'status':'withdrawn' if delta.get('withdraw') else 'accepted'}})
+                required_coverage.append('change-effect:'+delta['artifact'])
                 if current['revision']==delta['expected_revision'] and self._is_display_metadata_repair(current,delta):
                     required_coverage.append('display-metadata-equivalence:'+delta['artifact'])
             evidence=[]
@@ -433,19 +672,274 @@ class Planning:
                 artifact=self.k.artifact(Actor('system','owner'),ident)
                 evidence.append({'kind':'artifact','id':ident,'revision':artifact['revision'],'digest':artifact['digest'],
                                  'status':artifact['status'],'body':artifact['body']})
-            material={'format':'change-review-material.v1','change':change,'revision':row['revision'],'stage':row['stage'],'body':body,
-                      'current':[{k:a[k] for k in ('id','revision','digest','status')}
-                                 for a in [self.k.artifact(Actor('system','owner'),x) for x in body['affected']]],
+            upper_contracts=self._change_upper_contract_context(row['project'],roots)
+            interface_impacts=interface_impact_context(self.k,row['project'],body.get('deltas',[]))
+            scope_review=self._change_scope_review(change,row['stage'],body,row['project'],current_impact,
+                                                   upper_contracts,interface_impacts)
+            required_coverage.extend(item['id'] for item in scope_review['required_dispositions'])
+            material={'format':'change-review-material.v2','change':change,'revision':row['revision'],'stage':row['stage'],'body':body,
+                      'current':current_refs,'registered_impact':body.get('impact'),
+                      'current_impact':current_impact,
+                      'impact_matches_registration':canonical(current_impact)==canonical(body.get('impact')),
+                      'task_fence_candidates':self._change_fence_candidates(row['project'],change,current_impact),
                       'policy':self.g.policy(row['project'])['digest'],
                       'invariants':accepted_invariants(self.s,row['project']),
                       'before_after':before_after,'evidence':evidence,
-                      'required_coverage':sorted(required_coverage)}
-            impacts=interface_impact_context(self.k,row['project'],body.get('deltas',[]))
-            if impacts:
-                material['interface_impact']=impacts
+                      'upper_contracts':upper_contracts,'scope_review':scope_review,
+                      'required_coverage':sorted(set(required_coverage))}
+            if interface_impacts:
+                material['interface_impact']=interface_impacts
             if len(canonical(material))>700000:
                 material['required_coverage']=sorted(set(material['required_coverage']+['change-material:'+change]))
             return row, material
+
+    def _validate_change_scope_result(self,material,result,*,allow_upper=False,require_within=False):
+        protocol=material.get('scope_review')
+        need(isinstance(protocol,dict) and protocol.get('format')=='change-scope-review.v1',
+             'scope_review_required','Change review does not contain the typed layer-scope contract')
+        need(material.get('impact_matches_registration') is True,
+             'stale_change_impact','Recalculate and stop newly affected tasks before reviewing this change')
+        required=protocol.get('required_dispositions',[])
+        expected={item['id']:item for item in required}
+        need(len(expected)==len(required),'invalid_change_review','Controller scope disposition IDs are not unique')
+        covered=set(result.get('covered',[])) if isinstance(result.get('covered'),list) else set()
+        missing=set(expected)-covered
+        need(not missing,'incomplete_review_coverage','Independent review omitted change scope dispositions',
+             {'missing':sorted(missing)})
+        observed={}
+        for item in result.get('dispositions',[]):
+            if not isinstance(item,dict) or item.get('id') not in expected:
+                continue
+            marker=item['id']
+            need(marker not in observed,'invalid_change_review','Change scope disposition is duplicated',marker)
+            need(item.get('resolution') in expected[marker]['allowed'],
+                 'invalid_change_review','Change scope disposition used an unsupported resolution',
+                 {'id':marker,'resolution':item.get('resolution')})
+            need(isinstance(item.get('reason'),str) and item['reason'].strip(),
+                 'invalid_change_review','Change scope disposition needs a reason',marker)
+            observed[marker]=item
+        need(set(observed)==set(expected),'invalid_change_review',
+             'Independent review did not provide each typed change scope disposition',
+             {'missing':sorted(set(expected)-set(observed))})
+        scope=observed['scope:'+material['change']]['resolution']
+        target=observed['target:'+material['change']]['resolution']
+        layer=protocol.get('layer')
+        order=['local_repair','module_replan','system_replan','awaiting_product_decision']
+        need(layer in order and target in order,'invalid_change_review',
+             'Current change layer or reviewed target layer is unsupported')
+        if scope=='within_scope':
+            need(target==layer,'invalid_change_review',
+                 'A within-layer disposition must target the current layer',
+                 {'layer':layer,'target':target})
+        elif scope=='upper_scope_required':
+            need(order.index(target)>order.index(layer),'invalid_change_review',
+                 'An upper-scope disposition must identify a strictly higher layer',
+                 {'layer':layer,'target':target})
+        else:
+            need(target==layer,'invalid_change_review',
+                 'An unresolved disposition cannot authorize layer advancement',
+                 {'layer':layer,'target':target})
+        effects={item['subject']:observed[item['id']]['resolution']
+                 for item in required if item['kind']=='delta_effect'}
+        carry={item['subject']:observed[item['id']]['resolution']
+               for item in required if item['kind']=='review_carry_and_task_fence'}
+        consumers={item['id']:observed[item['id']]['resolution']
+                   for item in required if item['kind']=='interface_consumer'}
+        unknown={item['subject']:observed[item['id']]['resolution']
+                 for item in required if item['kind']=='declared_unknown_consumer'}
+        need(set(effects)=={item['artifact'] for item in material['body'].get('deltas',[])},
+             'invalid_change_review','Typed effect decisions do not cover the exact current delta set')
+        after_by={item['artifact']:item for item in material.get('before_after',[])}
+        observations=result.get('observations',[])
+        for artifact,resolution in effects.items():
+            detail=after_by[artifact]
+            if resolution=='preserves_meaning':
+                need(any(isinstance(obs,dict) and obs.get('ref')==artifact and
+                         isinstance(obs.get('detail'),str) and obs['detail'].strip()
+                         for obs in observations),
+                     'invalid_change_review','A meaning-preserving judgment must cite the exact artifact',artifact)
+            if resolution=='within_current_contract':
+                pins=material['upper_contracts']
+                upper_by={item['id']:item for item in pins.get('artifacts',[])}
+                def asserted_upper_path(path):
+                    if (path.get('root')!=artifact or path.get('upper')==artifact or
+                            upper_by.get(path.get('upper'),{}).get('status')!='accepted' or
+                            upper_by.get(path.get('upper'),{}).get('kind') not in {'requirement','interface'} or
+                            not path.get('path')):
+                        return False
+                    current=artifact;visited={artifact}
+                    for edge in path['path']:
+                        target=edge.get('walk_to');source=edge.get('walk_from')
+                        current_kind=upper_by.get(current,{}).get('kind')
+                        expected_relation={'decomposes'} if current_kind=='requirement' else {
+                            'realizes','derived_from','supersedes'}
+                        direction=(edge.get('relation') in expected_relation and
+                            edge.get('confidence')=='asserted' and source==current and
+                            isinstance(target,str) and target not in visited and
+                            ((edge.get('relation')=='decomposes' and
+                              edge.get('to')==source and edge.get('from')==target) or
+                             (edge.get('relation')!='decomposes' and
+                              edge.get('from')==source and edge.get('to')==target)))
+                        if not direction:return False
+                        current=target;visited.add(target)
+                    return current==path.get('upper')
+                linked_parent=any(asserted_upper_path(path) for path in pins.get('upper_paths',[]))
+                need(pins.get('bounded') is True and linked_parent,
+                     'upper_contract_required','A within-contract change needs an exact asserted parent contract pin',artifact)
+            if detail['kind']=='interface':
+                before=detail['before']['body'];after=detail['after']['body']
+                changed_contract_fields={key for key in set(before)|set(after)
+                    if key not in {'title','description'} and canonical(before.get(key))!=canonical(after.get(key))}
+                if changed_contract_fields and resolution!='preserves_meaning':
+                    need(scope!='within_scope','unknown_consumer',
+                         'Interface contract changes cannot close while external consumer completeness is unknown',
+                         {'artifact':artifact,'fields':sorted(changed_contract_fields)})
+            if resolution in {'changes_upper_contract','unknown'}:
+                need(scope!='within_scope','upper_scope_required',
+                     'A changed or unknown upper contract cannot be closed in this layer',artifact)
+        for marker,resolution in consumers.items():
+            need(resolution!='unknown' or scope!='within_scope','unknown_consumer',
+                 'Unknown interface consumers prevent local closure',marker)
+        for task,resolution in unknown.items():
+            need(scope!='within_scope','unknown_impact',
+                 'Caller-declared unknown consumers require controller discovery or upper review',task)
+        if not material['upper_contracts'].get('bounded'):
+            need(scope!='within_scope','upper_contract_unbounded',
+                 'The linked upper-contract neighborhood exceeds the bounded review scope')
+        if require_within:
+            need(scope=='within_scope','scope_escalation_required',
+                 'The independent review did not close this change within the current layer',scope)
+        if not allow_upper:
+            need(scope=='within_scope','scope_escalation_required',
+                 'The independent review requires an upper layer or left scope unresolved',scope)
+        interface_unknown=[]
+        for detail in after_by.values():
+            if detail['kind']!='interface':
+                continue
+            before=detail['before']['body'];after=detail['after']['body']
+            changed_fields={key for key in set(before)|set(after)
+                if key not in {'title','description'} and canonical(before.get(key))!=canonical(after.get(key))}
+            if changed_fields and effects[detail['artifact']]!='preserves_meaning':
+                interface_unknown.append(detail['artifact'])
+        return {'scope':scope,'target_layer':target,'layer':layer,
+                'effects':effects,'carry':carry,'consumers':consumers,
+                'unknown_neighbors':unknown,'dispositions':observed,
+                'unknown_interface_contracts':sorted(interface_unknown),
+                'all_meaning_preserved':bool(effects) and all(value=='preserves_meaning' for value in effects.values())}
+
+    def _revalidate_unaffected_change_tasks(self,actor,change,material,scope_result,receipt):
+        """Carry only a fenced, unstarted task whose exact pins can be advanced."""
+        if (not scope_result['all_meaning_preserved'] or material['body'].get('unknown_neighbors') or
+                material['upper_contracts'].get('bounded') is not True):
+            return []
+        candidates=material.get('task_fence_candidates',{})
+        approved={task for task,disposition in scope_result['carry'].items() if disposition=='unaffected'}
+        deltas={item['artifact']:item for item in material['body'].get('deltas',[])}
+        row=self.s.one('SELECT project,body,stage FROM changes WHERE id=?',(change,),True)
+        project=row['project'];change_body=parse_json(row['body'])
+        roots=sorted(deltas)
+        per_root={root:set(self.k.impact(Actor('system','owner'),project,[root])['tasks']) for root in roots}
+        valid=[]
+        for task in sorted(approved & set(candidates)):
+            before=candidates[task]
+            task_row=self.s.one('SELECT * FROM tasks WHERE id=? AND project=?',(task,project))
+            if task_row is None:
+                continue
+            reads_before=before.get('reads',[])
+            if not any(pin['artifact'] in deltas for pin in reads_before):
+                continue
+            current_reads=self.s.all('SELECT artifact,revision,digest FROM task_reads WHERE task=? ORDER BY artifact',(task,))
+            if canonical(current_reads)!=canonical(reads_before):
+                continue
+            updated_pins=[];pin_updates=[];eligible=True
+            for pin in reads_before:
+                artifact=self.s.one('SELECT project,revision,digest,status FROM artifacts WHERE id=?',(pin['artifact'],))
+                delta=deltas.get(pin['artifact'])
+                if delta:
+                    if (artifact is None or artifact['project']!=project or artifact['status']!='accepted' or
+                            artifact['revision']!=delta['expected_revision']+1 or
+                            artifact['digest']!=digest(delta['body']) or
+                            pin['revision']!=delta['expected_revision']):
+                        eligible=False;break
+                    updated={'artifact':pin['artifact'],'revision':artifact['revision'],'digest':artifact['digest']}
+                    pin_updates.append((updated,pin))
+                else:
+                    if (artifact is None or artifact['project']!=project or artifact['status']!='accepted' or
+                            artifact['revision']!=pin['revision'] or artifact['digest']!=pin['digest']):
+                        eligible=False;break
+                    updated=pin
+                updated_pins.append(updated)
+            expected_roots=[root for root in roots if task in per_root[root]]
+            expected_blocks=[{'kind':'change','ref':change,'reason':change_body['reason']}]
+            expected_blocks.extend({'kind':'changed_input','ref':root,'reason':'Change '+change}
+                                   for root in expected_roots)
+            current_blocks=self.s.all('SELECT kind,ref,reason FROM blocks WHERE task=? ORDER BY kind,ref',(task,))
+            expected_epoch=before['epoch']+1+len(expected_roots)
+            if (not eligible or not expected_roots or task_row['status']!='planned' or
+                    task_row['validity']!='needs_review' or task_row['revision']!=before['revision'] or
+                    task_row['epoch']!=expected_epoch or task_row['candidate'] is not None or
+                    task_row['lease_owner'] is not None or task_row['lease_until'] is not None or
+                    task_row['paused'] or digest(task_row['body'].encode())!=before['task_body_digest'] or
+                    canonical(current_blocks)!=canonical(expected_blocks) or
+                    self.s.one('SELECT task FROM plans WHERE task=?',(task,)) is not None or
+                    self.s.one('SELECT 1 FROM runs WHERE task=? LIMIT 1',(task,)) is not None or
+                    self.s.one('SELECT 1 FROM candidates WHERE task=? LIMIT 1',(task,)) is not None or
+                    self.s.one('SELECT 1 FROM execution_attempts WHERE task=? LIMIT 1',(task,)) is not None or
+                    self.s.one('SELECT 1 FROM local_execution_records WHERE task=? LIMIT 1',(task,)) is not None):
+                continue
+            old_pins=[]
+            for updated,pin in pin_updates:
+                cursor=self.s.execute('UPDATE task_reads SET revision=?,digest=? WHERE task=? AND artifact=? AND revision=? AND digest=?',
+                    (updated['revision'],updated['digest'],task,pin['artifact'],pin['revision'],pin['digest']))
+                need(cursor.rowcount==1,'stale_task_fence',
+                     'A task input changed while its unaffected status was being revalidated',
+                     {'task':task,'artifact':pin['artifact']})
+                old_pins.append(pin)
+            cursor=self.s.execute("UPDATE tasks SET validity='current',updated=? WHERE id=? AND project=? "
+                "AND status='planned' AND validity='needs_review' AND revision=? AND epoch=? "
+                "AND candidate IS NULL AND lease_owner IS NULL AND lease_until IS NULL AND paused=0",
+                (timestamp(),task,project,before['revision'],expected_epoch))
+            need(cursor.rowcount==1,'stale_task_fence',
+                 'A task changed while its unaffected status was being revalidated',task)
+            for root in expected_roots:
+                self.s.execute("DELETE FROM blocks WHERE task=? AND kind='changed_input' AND ref=?",(task,root))
+            proof={'task':task,'change':change,'receipt':receipt,'before_epoch':before['epoch'],
+                'current_epoch':expected_epoch,'task_body_digest':before['task_body_digest'],
+                'old_pins':old_pins,'new_pins':[item for item,_ in pin_updates],
+                'cleared_input_blocks':expected_roots,'scope_disposition':'unaffected'}
+            self.sec.event(project,'task_revalidated_after_unaffected_change',actor.id,proof)
+            valid.append(proof)
+        return valid
+
+    def _has_current_system_no_solution_path(self,change,scope_result):
+        """Accept a user decision after a reviewed, final system-layer infeasibility attempt."""
+        if (scope_result.get('scope')!='within_scope' or
+                scope_result.get('layer')!='system_replan' or
+                scope_result.get('target_layer')!='system_replan'):
+            return False
+        latest=self.s.one("SELECT a.*,e.body AS attempt_event FROM attempts a JOIN events e "
+            "ON e.project=(SELECT project FROM changes WHERE id=a.change_id) "
+            "AND e.kind='feasibility_attempt' AND json_extract(e.body,'$.attempt')=a.id "
+            "WHERE a.change_id=? ORDER BY e.seq DESC,e.id DESC LIMIT 1",(change,))
+        if latest is None or latest['level']!='system_replan':
+            return False
+        attempt={'id':latest['id'],'body':latest['body']}
+        body=parse_json(attempt['body']);receipt_id=body.get('review_receipt')
+        if body.get('outcome')!='no_solution_found' or not isinstance(receipt_id,str):
+            return False
+        event_body=parse_json(latest['attempt_event'])
+        if (event_body.get('stage')!='awaiting_product_decision' or
+                event_body.get('outcome')!='no_solution_found' or
+                event_body.get('scope_disposition')!='within_scope' or
+                event_body.get('scope_target')!='system_replan' or
+                event_body.get('review_receipt')!=receipt_id):
+            return False
+        review=self.g.receipt(receipt_id)
+        if review.get('role')!='feasibility' or review.get('subject')!=change or \
+                review.get('result',{}).get('verdict')!='pass':
+            return False
+        self.g.require_review(receipt_id,change,review['binding'],{'feasibility'},latest=True)
+        return True
 
     def change_binding(self,change):
         _, material=self.change_review_material(change)
@@ -458,6 +952,7 @@ class Planning:
         body=parse_json(row['body'])
         return {'id':change,'project':row['project'],'revision':row['revision'],'stage':row['stage'],
                 'title':body['title'],'origin':body['origin'],'affected':body['affected'],
+                'no_effect':bool(body.get('no_effect')),
                 'binding':digest(material),'material_format':material['format'] if 'format' in material else 'change-review-material.v1',
                 'read_operation':'change.read','read_digest':digest(canonical(material))}
 
@@ -478,24 +973,52 @@ class Planning:
         obj(body,required=('hypothesis','alternatives','evidence','outcome','remaining_unknown'),optional=('resource_limit','solution','review_receipt'))
         text(body['hypothesis'],'hypothesis',12000);strings(body['alternatives'],'alternatives',nonempty=True)
         strings(body['evidence'],'evidence',nonempty=True);text(body['remaining_unknown'],'unknowns',12000,empty=True)
-        need(body['outcome'] in {'solution','no_solution_found','resource_exhausted'},'invalid_outcome','Invalid feasibility result')
+        need(body['outcome'] in {'solution','no_solution_found','resource_exhausted','scope_exceeded'},
+             'invalid_outcome','Invalid feasibility or scope result')
         for ev in body['evidence']: self.g.receipt(ev)
-        if body['outcome']=='no_solution_found':
+        scope_result=None
+        if body['outcome'] in {'no_solution_found','scope_exceeded'}:
             need(body.get('review_receipt'),'review_required','Independent assessment is required before escalation')
-            self.g.require_review(body['review_receipt'],change,self.change_binding(change),{'feasibility'},latest=True)
+            review=self.g.receipt(body['review_receipt'])
+            _,material=self.change_review_material(change)
+            if review.get('role')=='consistency':
+                self.g.require_review(body['review_receipt'],change,digest(material),{'consistency'},latest=True)
+            else:
+                self.g.require_review(body['review_receipt'],change,self.change_binding(change),{'feasibility'},latest=True)
+            scope_result=self._validate_change_scope_result(material,review.get('result',{}),
+                allow_upper=True,require_within=False)
+            need(scope_result['scope']!='unresolved','scope_unresolved',
+                 'An unresolved scope review cannot advance this change')
+            if body['outcome']=='scope_exceeded':
+                need(scope_result['scope']=='upper_scope_required','scope_escalation_required',
+                     'Direct layer routing requires an independently reviewed upper-scope disposition')
         with self.s.transaction():
             ident=uid('ATTEMPT')
             self.s.execute("INSERT INTO attempts VALUES(?,?,?,?,?)",(ident,change,level,canonical(body).decode(),timestamp()))
             if body['outcome']=='no_solution_found':
-                next_stage={'local_repair':'module_replan','module_replan':'system_replan','system_replan':'awaiting_product_decision'}[level]
+                next_stage=(scope_result['target_layer'] if scope_result['scope']=='upper_scope_required' else
+                    {'local_repair':'module_replan','module_replan':'system_replan',
+                     'system_replan':'awaiting_product_decision'}[level])
+            elif body['outcome']=='scope_exceeded': next_stage=scope_result['target_layer']
             elif body['outcome']=='solution': next_stage='reconciling'
             else: next_stage=level
-            self.s.execute("UPDATE changes SET stage=?,revision=revision+1 WHERE id=?",(next_stage,change))
+            change_body=parse_json(row['body'])
+            change_body['scope_layer']=(level if next_stage=='awaiting_product_decision' else next_stage) \
+                if body['outcome'] in {'no_solution_found','scope_exceeded'} else level
+            self.s.execute("UPDATE changes SET stage=?,body=?,revision=revision+1 WHERE id=?",
+                           (next_stage,canonical(change_body).decode(),change))
             if next_stage=='awaiting_product_decision' or body['outcome']=='resource_exhausted':
                 kind='product_decision' if next_stage=='awaiting_product_decision' else 'search_incomplete'
                 self._publish_change_notice(row['project'],change,parse_json(self.s.one('SELECT body FROM changes WHERE id=?',(change,),True)['body']),body,kind=kind)
-            self.sec.event(row['project'],'feasibility_attempt',actor.id,{'change':change,'level':level,'outcome':body['outcome'],'stage':next_stage})
-        return {'id':ident,'stage':next_stage,'note':'Resource exhaustion is not proof of infeasibility.'}
+            self.sec.event(row['project'],'feasibility_attempt',actor.id,{'change':change,'level':level,
+                'attempt':ident,
+                'outcome':body['outcome'],'stage':next_stage,
+                'scope_disposition':scope_result['scope'] if scope_result else None,
+                'scope_target':scope_result['target_layer'] if scope_result else None,
+                'review_receipt':body.get('review_receipt')})
+        note=('The reviewed scope requires a higher layer; no infeasibility is claimed.'
+              if body['outcome']=='scope_exceeded' else 'Resource exhaustion is not proof of infeasibility.')
+        return {'id':ident,'stage':next_stage,'note':note}
 
     def set_delta(self,actor,change,expected_revision,deltas,reason,force_revision=False):
         row=self.s.one("SELECT * FROM changes WHERE id=?",(change,),True)
@@ -507,22 +1030,89 @@ class Planning:
             self.validate_deltas(actor,row['project'],deltas)
             body=parse_json(row['body'])
             history=body.get('delta_history',[])
+            if (not force_revision and body.get('no_effect') and
+                    canonical(body.get('deltas',[]))==canonical(deltas)):
+                for ref in body['baseline_refs']:
+                    art=self.k.artifact(actor,ref['id'])
+                    need(art['revision']==ref['revision'] and art['digest']==ref['digest'],
+                         'stale_revision','Change baseline is no longer current')
+                replay_roots=self._change_roots(body)
+                replay_impact=self.k.impact(actor,row['project'],replay_roots)
+                if replay_roots==body.get('impact_roots') and canonical(replay_impact)==canonical(body.get('impact')):
+                    self.sec.event(row['project'],'change_delta_replayed',actor.id,
+                                   {'change':change,'revision':expected_revision})
+                    return {'id':change,'revision':expected_revision,'binding':self.change_binding(change),
+                            'unchanged':True,'no_effect':True}
             if (not force_revision and history and history[-1].get('actor')==actor.id
-                and history[-1]['revision']==expected_revision-1 and history[-1].get('stage')==row['stage']
                 and history[-1]['reason']==reason and canonical(body.get('deltas',[]))==canonical(deltas)):
                 for ref in body['baseline_refs']:
                     art=self.k.artifact(actor,ref['id'])
                     need(art['revision']==ref['revision'] and art['digest']==ref['digest'],
                          'stale_revision','Change baseline is no longer current')
-                self.sec.event(row['project'],'change_delta_replayed',actor.id,{'change':change,'revision':expected_revision})
-                return {'id':change,'revision':expected_revision,'binding':self.change_binding(change),'unchanged':True}
-            body['deltas']=deltas;body.setdefault('delta_history',[]).append({'reason':reason,'revision':expected_revision,'actor':actor.id,'stage':row['stage']})
+                replay_roots=self._change_roots(body)
+                replay_impact=self.k.impact(actor,row['project'],replay_roots)
+                if (replay_roots==body.get('impact_roots') and
+                        canonical(replay_impact)==canonical(body.get('impact'))):
+                    self.sec.event(row['project'],'change_delta_replayed',actor.id,{'change':change,'revision':expected_revision})
+                    return {'id':change,'revision':expected_revision,'binding':self.change_binding(change),'unchanged':True}
+            old_impact=body.get('impact',{})
+            was_no_effect=bool(body.get('no_effect'))
+            body['deltas']=deltas
+            no_effect=self._change_has_no_effect(actor,row['project'],body,deltas)
+            body['no_effect']=no_effect
+            roots=self._change_roots(body)
+            current_refs={}
+            for artifact_id in roots:
+                artifact=self.k.artifact(actor,artifact_id)
+                current_refs[artifact_id]={k:artifact[k] for k in ('id','revision','digest')}
+                previous=next((item for item in body.get('baseline_refs',[]) if item.get('id')==artifact_id),None)
+                changed_target=any(item['artifact']==artifact_id for item in deltas)
+                if previous is not None and not changed_target:
+                    need(previous['revision']==artifact['revision'] and previous['digest']==artifact['digest'],
+                         'stale_revision','An affected artifact changed while the change was open',artifact_id)
+            new_impact=self.k.impact(actor,row['project'],roots)
+            unknown=set(body.get('unknown_neighbors',[]))
+            new_tasks=(set(new_impact.get('tasks',[])) if was_no_effect else
+                       set(new_impact.get('tasks',[]))-set(old_impact.get('tasks',[])))
+            task_fence=({'format':'keep-existing-task-fence.v1','change':change,
+                         'candidates':{},'scope':'no_effect'} if no_effect else
+                self._capture_keep_existing_task_fence(row['project'],change,
+                    {**new_impact,'tasks':sorted(new_tasks)},unknown))
+            body['impact_roots']=roots;body['impact']=new_impact
+            body['baseline_refs']=[current_refs[item] for item in roots]
+            body.setdefault('delta_history',[]).append({'reason':reason,'revision':expected_revision,'actor':actor.id,'stage':row['stage']})
             self.s.execute("UPDATE changes SET body=?,revision=revision+1 WHERE id=?",(canonical(body).decode(),change))
             self._terminalize_change_decisions(row['project'],change,actor.id,'change_delta_revised')
-            self._refresh_change_notice(row['project'],change,body,row['stage'],actor.id)
+            task_revalidations=[]
+            if no_effect:
+                task_revalidations=self._restore_no_effect_task_fences(actor,row['project'],change,
+                    body,new_impact)
+                self.s.execute("DELETE FROM blocks WHERE kind='change' AND ref=?",(change,))
+            else:
+                for task in sorted(new_tasks|unknown):
+                    self.s.execute("INSERT OR REPLACE INTO blocks VALUES(?,?,?,?)",(task,'change',change,body['reason']))
+                    self.s.execute("UPDATE tasks SET validity='needs_review',epoch=epoch+1,lease_until=NULL,updated=? WHERE id=?",
+                                   (timestamp(),task))
+            if no_effect:
+                self._close_notices(row['project'],change,actor.id,'change_has_no_effect')
+                if row['stage']=='awaiting_product_decision':
+                    self.g.inbox(row['project'],'search_incomplete',change,{
+                        'change':change,'revision':expected_revision+1,'no_effect':True,
+                        'request_fulfilled':False,
+                        'message':'The submitted artifact delta leaves accepted artifacts unchanged; the source request remains unresolved.'},'warning')
+                self.sec.event(row['project'],'change_no_effect_observed',actor.id,{'change':change,
+                    'origin':body['origin'],'source':body.get('source'),'request_fulfilled':False,
+                    'delta_targets':sorted(item['artifact'] for item in deltas),
+                    'task_revalidations':task_revalidations})
+            else:
+                self._refresh_change_notice(row['project'],change,body,row['stage'],actor.id)
+            self.sec.event(row['project'],'change_impact_recalculated',actor.id,{'id':change,
+                'impact':new_impact,'added_tasks':sorted(new_tasks),'task_fence':task_fence,
+                'no_effect':no_effect})
             self.sec.event(row['project'],'change_delta_revised',actor.id,{'change':change,'revision':expected_revision+1})
             binding=self.change_binding(change)
-        return {'id':change,'revision':expected_revision+1,'binding':binding}
+        return {'id':change,'revision':expected_revision+1,'binding':binding,
+                'no_effect':no_effect,'task_revalidations':task_revalidations}
 
     def conflict(self,actor,project,refs,explanation,options):
         actor.require('owner','agent',project=project)
@@ -625,7 +1215,8 @@ class Planning:
         body={**body,'bindings':[{k:a[k] for k in ('id','revision','digest')} for a in [self.k.artifact(actor,x) for x in body['refs']]]}
         if body.get('change'):
             change=self.s.one("SELECT * FROM changes WHERE id=? AND project=?",(body['change'],project),True)
-            need(change['stage']=='awaiting_product_decision','premature_escalation','Try local, module and system remedies before product escalation')
+            need(change['stage']=='awaiting_product_decision','premature_escalation',
+                 'An independent scope review must route this change to the product-decision layer before a human decision is proposed')
             body['change_binding']=self.change_binding(body['change'])
         if body.get('conflict'):self.s.one("SELECT id FROM conflicts WHERE id=? AND project=?",(body['conflict'],project),True)
         if body.get('supersedes'):
@@ -867,7 +1458,7 @@ class Planning:
                 return expiry
         return {'id':decision,'status':status,'consistency_recheck_required':status=='decision_received'}
 
-    def decision_review_material(self,decision):
+    def decision_review_material(self,decision,*,allow_stale_linked_change=False):
         """Canonical material shared by the consistency prompt and its binding."""
         from .review_dependencies import accepted_invariants
         row=self.s.one("SELECT * FROM decisions WHERE id=?",(decision,),True)
@@ -881,7 +1472,8 @@ class Planning:
         if body.get('change'):
             change_row,full_change_material=self.change_review_material(body['change'])
             current_change_binding=digest(full_change_material)
-            need(change_row['project']==row['project'] and body.get('change_binding')==current_change_binding,
+            need(change_row['project']==row['project'] and
+                 (allow_stale_linked_change or body.get('change_binding')==current_change_binding),
                  'stale_decision','The linked change was revised after this decision was proposed')
             change_material={'id':body['change'],'revision':change_row['revision'],
                              'binding':current_change_binding,'read_operation':'change.read',
@@ -929,6 +1521,7 @@ class Planning:
             material['other_decisions'][index]=external
             material['required_coverage'].append('other-decision:'+item['id'])
         if full_change_material is not None:
+            material['required_coverage'].extend(full_change_material.get('required_coverage',[]))
             # Keep small linked changes visible in the standard prompt. Large
             # ones remain exact, digest-bound packets read through change.read.
             if len(canonical(material))+len(canonical(full_change_material))<=700000:
@@ -956,25 +1549,34 @@ class Planning:
             if incremental_from:
                 try:
                     context=self.decision_incremental_context(actor,decision,incremental_from,current_material=current)
-                    value['incremental_review']={'available':True,'binding':digest(current),
-                        'context_digest':digest(context),'required_coverage':context['required_coverage'],
-                        'added_artifact':context['proof']['added_artifact']['id']}
+                    incremental={'available':True,'binding':digest(current),
+                        'context_digest':digest(context),'required_coverage':context['required_coverage']}
+                    if context['format']=='decision-apply-incremental-review.v1':
+                        incremental['applied_decisions']=[item['decision'] for item in context['applied_effects']]
+                    else:
+                        incremental['added_artifact']=context['proof']['added_artifact']['id']
+                    value['incremental_review']=incremental
                 except Fault as exc:
                     if exc.code!='incremental_review_unavailable':raise
                     value['incremental_review']={'available':False,'reason':exc.message}
             return value
         identity=self.s.one('SELECT project FROM decisions WHERE id=?',(decision,),True)
         self.k.project(actor,identity['project'])
-        project,material=self.decision_review_material(decision)
+        project,material=self.decision_review_material(decision,
+            allow_stale_linked_change=bool(incremental_from))
         value={'decision':decision,'project':project,'binding':digest(material),
                 'format':material['format'],'material':material,
                 'linked_change':material.get('linked_change')}
         if incremental_from:
             try:
                 context=self.decision_incremental_context(actor,decision,incremental_from,current_material=material)
-                value['incremental_review']={'available':True,'binding':digest(material),
-                    'context_digest':digest(context),'required_coverage':context['required_coverage'],
-                    'added_artifact':context['proof']['added_artifact']['id']}
+                incremental={'available':True,'binding':digest(material),
+                    'context_digest':digest(context),'required_coverage':context['required_coverage']}
+                if context['format']=='decision-apply-incremental-review.v1':
+                    incremental['applied_decisions']=[item['decision'] for item in context['applied_effects']]
+                else:
+                    incremental['added_artifact']=context['proof']['added_artifact']['id']
+                value['incremental_review']=incremental
             except Fault as exc:
                 if exc.code!='incremental_review_unavailable':raise
                 value['incremental_review']={'available':False,'reason':exc.message}
@@ -1109,6 +1711,316 @@ class Planning:
         return {'id':added_id,'kind':row['kind'],'revision':row['revision'],'digest':row['digest'],
                 'status':row['status'],'body':body},sources,links
 
+    @staticmethod
+    def _artifact_projection(artifact):
+        return {key:artifact[key] for key in ('id','project','revision','digest','status','kind','body')}
+
+    def _decision_apply_incremental_context(self,actor,subject,base_receipt,current_material,
+                                            base_review_data=None):
+        """Prove bounded prior single-decision applies are the only material drift."""
+        project_row=self.s.one('SELECT project FROM decisions WHERE id=?',(subject,))
+        if project_row is None:
+            return None
+        project=project_row['project']
+        if base_review_data is None:
+            base_review_data=self._base_incremental_review(actor,subject,base_receipt,False)
+        base_review,base_run,_,base_material,old_required,base_seq=base_review_data
+        timeline=self.s.all('SELECT id,seq,kind,body FROM events WHERE project=? AND seq>? ORDER BY seq,id LIMIT 1001',
+                            (project,base_seq))
+        applied=[row for row in timeline if row['kind']=='decision_applied']
+        if not applied:
+            return None
+        need(len(applied)<=20,'incremental_review_unavailable',
+             'Sequential apply proof is bounded to at most twenty earlier decisions')
+        allowed={'run_registered','run_observed','decision_applied','change_applied','artifact_revised',
+                 'decision_apply_incremental_review_applied','notification_closed','source_registered',
+                 'adapter_registered','provider_configured','autonomy_configured','native_session_attached',
+                 'native_decision_presented','native_user_input_recorded','inbox_displayed',
+                 'inbox_acknowledged','notification_published','job_queued','job_attempt_finished',
+                 'job_cancel_requested','lease_expired','timer_fired','index_completed',
+                 'external_read_failed','run_incomplete','scheduler_fault','rpc_internal_error',
+                 'artifact_save_replayed','change_delta_replayed'}
+        need(len(timeline)<=1000 and all(row['kind'] in allowed for row in timeline),
+             'incremental_review_unavailable',
+             'The current material changed through an unsupported event; run a full consistency review')
+        base_other={item['id']:item for item in base_material.get('other_decisions',[])
+                    if isinstance(item,dict) and isinstance(item.get('id'),str)}
+        current_other={item['id']:item for item in current_material.get('other_decisions',[])
+                       if isinstance(item,dict) and isinstance(item.get('id'),str)}
+        base_artifacts={item['id']:item for item in base_material.get('current_artifacts',[])
+                        if isinstance(item,dict) and isinstance(item.get('id'),str)}
+        current_artifacts={item['id']:item for item in current_material.get('current_artifacts',[])
+                           if isinstance(item,dict) and isinstance(item.get('id'),str)}
+        need(len(base_artifacts)==len(base_material.get('current_artifacts',[])) and
+             len(current_artifacts)==len(current_material.get('current_artifacts',[])),
+             'incremental_review_unavailable','Accepted artifact projection is malformed')
+        current_decision=self.s.one('SELECT * FROM decisions WHERE id=? AND project=?',(subject,project),True)
+        base_proposal=base_material.get('proposal')
+        need(base_material.get('decision')==subject and isinstance(base_proposal,dict) and
+             base_material.get('digest')==current_decision['digest'] and
+             canonical(base_proposal)==canonical(parse_json(current_decision['body'])) and
+             base_material.get('response')==current_decision['response'] and
+             base_material.get('source')==current_decision['source'] and
+             current_decision['status']=='decision_received',
+             'incremental_review_unavailable',
+             'The current proposal, human answer, or decision state changed since its full review')
+        actions=[];changed_targets=set();processed_change_events=set();previous_decisions=set()
+        for event_row in applied:
+            event=parse_json(event_row['body']);prior_id=event.get('decision')
+            need(isinstance(prior_id,str) and prior_id!=subject and not event.get('batch') and
+                 prior_id in base_other,
+                 'incremental_review_unavailable',
+                 'Only individually reviewed prior decisions visible in the full packet can be carried')
+            old_decision=base_other[prior_id]
+            decision_row=self.s.one('SELECT * FROM decisions WHERE id=? AND project=?',(prior_id,project),True)
+            prior_body=parse_json(decision_row['body'])
+            need(old_decision.get('status') in {'decision_received','provisional'} and
+                 decision_row['status']=='applied' and decision_row['digest']==old_decision.get('digest') and
+                 canonical(prior_body)==canonical(old_decision.get('body')) and
+                 decision_row['response']==old_decision.get('response') and
+                 event.get('selected_effect') in {'accept','record_only'} and event.get('receipt'),
+                 'incremental_review_unavailable',
+                 'A prior decision changed beyond a recorded single apply')
+            source=self.s.one('SELECT project,trust,blob FROM sources WHERE id=?',(decision_row['source'],))
+            answer=self.response_evidence(prior_id)
+            need(source is not None and source['project']==project and source['trust']=='human' and
+                 answer is not None and answer['body'].get('digest')==decision_row['digest'] and
+                 answer['body'].get('choice')==decision_row['response'] and
+                 answer['body'].get('source')==decision_row['source'],
+                 'incremental_review_unavailable','A prior apply no longer has its exact trusted human answer')
+            effect=self._choice_effect(prior_body,decision_row['response'])
+            prior_actions=self._decision_effect_actions(prior_body,effect)
+            if effect=='record_only':
+                need(not any(prior_actions.values()) and not self._decision_has_effects(prior_body),
+                     'incremental_review_unavailable',
+                     'A record-only decision cannot also carry a side effect')
+                previous_decisions.add(prior_id)
+                actions.append({'decision':prior_id,
+                    'decision_event':{'id':event_row['id'],'seq':event_row['seq'],'body':event},
+                    'change_event':None,'artifact_event':None,'change':None,'change_revision':None,
+                    'change_body_digest':None,'target':None,'before':None,'after':None,
+                    'selected_effect':'record_only','review_receipt':event['receipt']})
+                continue
+            need(effect=='accept' and prior_actions['apply_change'] and not any(prior_actions[key] for key in
+                 ('decline_change','apply_policy','resolve_conflict','supersede')) and
+                 not prior_body.get('conflict') and not prior_body.get('supersedes') and
+                 prior_body.get('type')!='policy',
+                 'incremental_review_unavailable',
+                 'Only exact accepted single-change effects or no-effect record-only decisions can be carried')
+            change=prior_body.get('change')
+            change_row=self.s.one('SELECT * FROM changes WHERE id=? AND project=?',(change,project),True)
+            change_body=parse_json(change_row['body'])
+            change_events=[]
+            for candidate in timeline:
+                if candidate['kind']!='change_applied':continue
+                details=parse_json(candidate['body'])
+                if details.get('decision')==prior_id and details.get('change')==change and \
+                        details.get('receipt')==event.get('receipt') and candidate['seq']<event_row['seq']:
+                    change_events.append((candidate,details))
+            need(len(change_events)==1 and change_row['stage']=='ready_for_reimplementation' and
+                 change_row['revision']>1 and change_events[0][0]['id'] not in processed_change_events,
+                 'incremental_review_unavailable','A prior change apply has no unique current event proof')
+            change_event,change_event_body=change_events[0]
+            processed_change_events.add(change_event['id'])
+            deltas=change_body.get('deltas',[])
+            delta_ids=[delta.get('artifact') for delta in deltas if isinstance(delta,dict)]
+            need(len(deltas)==1 and len(delta_ids)==1 and isinstance(delta_ids[0],str) and
+                 change_event_body.get('changed')==delta_ids and not deltas[0].get('withdraw'),
+                 'incremental_review_unavailable',
+                 'Sequential supplemental review currently accepts one non-withdrawn target per prior change')
+            artifact_id=delta_ids[0]
+            need(artifact_id not in changed_targets and artifact_id in base_artifacts and
+                 artifact_id in current_artifacts,
+                 'incremental_review_unavailable','Sequential changes overlap or leave the reviewed artifact set')
+            delta=deltas[0];before_row=base_artifacts[artifact_id]
+            before=self.k.artifact(Actor('system','owner'),artifact_id,delta['expected_revision'])
+            after=self.k.artifact(Actor('system','owner'),artifact_id)
+            need(before_row.get('status')=='accepted' and
+                 before_row.get('revision')==delta.get('expected_revision') and
+                 before_row.get('digest')==before.get('digest') and
+                 after['status']=='accepted' and after['revision']==before['revision']+1 and
+                 canonical(after['body'])==canonical(delta['body']) and
+                 after['digest']==digest(delta['body']) and
+                 current_artifacts[artifact_id]=={'id':artifact_id,'revision':after['revision'],
+                      'digest':after['digest'],'status':'accepted'},
+                 'incremental_review_unavailable',
+                 'A prior artifact is not exactly the recorded one-revision decision result')
+            artifact_events=[]
+            for candidate in timeline:
+                if candidate['kind']!='artifact_revised':continue
+                details=parse_json(candidate['body'])
+                if details.get('id')==artifact_id and details.get('revision')==after['revision'] and \
+                        details.get('digest')==after['digest'] and \
+                        candidate['seq']<change_event['seq'] and candidate['seq']<event_row['seq']:
+                    artifact_events.append((candidate,details))
+            need(len(artifact_events)==1,
+                 'incremental_review_unavailable',
+                 'A prior change target has no unique exact artifact-revision event')
+            prior_change_targets={d['artifact'] for d in parse_json(self.s.one(
+                'SELECT body FROM changes WHERE id=?',(parse_json(current_decision['body']).get('change'),),True)['body']).get('deltas',[])} \
+                if parse_json(current_decision['body']).get('change') else set()
+            need(artifact_id not in prior_change_targets,'incremental_review_unavailable',
+                 'A prior decision modified this decision\'s target')
+            historical=self.k.artifact(Actor('system','owner'),artifact_id,before['revision'])
+            before_projection=self._artifact_projection(historical)
+            # Acceptance may be a status transition without a new artifact
+            # revision, so the historical revision row can say draft while the
+            # immutable full-review packet correctly records it as accepted.
+            before_projection['status']=before_row['status']
+            after_projection=self._artifact_projection(after)
+            changed_targets.add(artifact_id);previous_decisions.add(prior_id)
+            actions.append({'decision':prior_id,
+                'decision_event':{'id':event_row['id'],'seq':event_row['seq'],'body':event},
+                'change_event':{'id':change_event['id'],'seq':change_event['seq'],'body':change_event_body},
+                'artifact_event':{'id':artifact_events[0][0]['id'],'seq':artifact_events[0][0]['seq'],
+                                  'body':artifact_events[0][1]},
+                'change':change,'change_revision':change_row['revision'],
+                'change_body_digest':digest(change_body),'target':artifact_id,
+                'before':before_projection,'after':after_projection,
+                'selected_effect':event['selected_effect'],'review_receipt':event['receipt']})
+        change_effect_count=sum(item['change_event'] is not None for item in actions)
+        target_effect_count=sum(item['target'] is not None for item in actions)
+        need(len(processed_change_events)==change_effect_count and
+             change_effect_count==len([row for row in timeline if row['kind']=='change_applied']),
+             'incremental_review_unavailable','An unrelated change was applied after the base review')
+        need(len([row for row in timeline if row['kind']=='artifact_revised'])==target_effect_count,
+             'incremental_review_unavailable','An unrelated artifact revision occurred after the base review')
+        supplemental_events=[parse_json(row['body']) for row in timeline
+                             if row['kind']=='decision_apply_incremental_review_applied']
+        need(all(event.get('decision') in previous_decisions and
+                 isinstance(event.get('proof'),dict) and
+                 event['proof'].get('format')=='decision-apply-incremental-proof.v1'
+                 for event in supplemental_events),
+             'incremental_review_unavailable','A prior supplemental apply event has no matching proof')
+        known_refs=previous_decisions|{item['change'] for item in actions}
+        for row in timeline:
+            if row['kind']=='notification_closed':
+                need(parse_json(row['body']).get('ref') in known_refs,
+                     'incremental_review_unavailable','An unrelated user-facing notice changed after the base review')
+        need(canonical(base_material.get('invariants',[]))==
+             canonical(current_material.get('invariants',[])),
+             'incremental_review_unavailable','Accepted invariants changed; run a full consistency review')
+        normalized=copy.deepcopy(current_material)
+        # Prior decision status is the only allowed change in the other-decision list.
+        normalized_other={item['id']:item for item in normalized.get('other_decisions',[])
+                          if isinstance(item,dict) and isinstance(item.get('id'),str)}
+        for effect in actions:
+            prior_id=effect['decision'];old=base_other[prior_id];now=normalized_other.get(prior_id)
+            need(now is not None and now.get('status')=='applied' and
+                 canonical({key:value for key,value in now.items() if key!='status'})==
+                 canonical({key:value for key,value in old.items() if key!='status'}),
+                 'incremental_review_unavailable','A prior decision changed beyond its applied status')
+            normalized_other[prior_id]=old
+        normalized['other_decisions']=sorted(normalized_other.values(),key=lambda item:item['id'])
+        # Match only the exact old/new revision pair proven by each apply event.
+        normalized_rows={item['id']:item for item in normalized.get('current_artifacts',[])}
+        base_rows={item['id']:item for item in base_material.get('current_artifacts',[])}
+        for effect in actions:
+            ident=effect['target']
+            if ident is None:
+                continue
+            old=base_rows[ident];now=normalized_rows.get(ident)
+            need(now=={'id':ident,'revision':effect['after']['revision'],
+                       'digest':effect['after']['digest'],'status':'accepted'} and
+                 old=={'id':ident,'revision':effect['before']['revision'],
+                       'digest':effect['before']['digest'],'status':'accepted'},
+                 'incremental_review_unavailable','Current accepted artifact differs from an exact prior apply')
+            normalized_rows[ident]=old
+        normalized['current_artifacts']=sorted(normalized_rows.values(),key=lambda item:item['id'])
+        prior_by_id={item['target']:item for item in actions if item['target'] is not None}
+        def normalize_change_material(current_change,base_change):
+            if not isinstance(current_change,dict) or not isinstance(base_change,dict):
+                raise Fault('incremental_review_unavailable','Linked change material is unavailable for bounded comparison')
+            need(current_change.get('format')==base_change.get('format')=='change-review-material.v2',
+                 'incremental_review_unavailable','Linked change material format changed')
+            value=copy.deepcopy(current_change)
+            def normalize_refs(rows,old_rows):
+                if not isinstance(rows,list) or not isinstance(old_rows,list): return
+                old_by={item.get('id'):item for item in old_rows if isinstance(item,dict)}
+                for index,item in enumerate(rows):
+                    if not isinstance(item,dict) or item.get('id') not in prior_by_id:continue
+                    effect=prior_by_id[item['id']];old=old_by.get(item['id'])
+                    expected_new={'id':item['id'],'revision':effect['after']['revision'],
+                                  'digest':effect['after']['digest']}
+                    expected_old={'id':item['id'],'revision':effect['before']['revision'],
+                                  'digest':effect['before']['digest']}
+                    need(item==expected_new and old==expected_old,
+                         'incremental_review_unavailable','Linked change artifact pins changed beyond a proven apply')
+                    rows[index]=old
+            normalize_refs(value.get('current'),base_change.get('current'))
+            for key in ('upper_contracts',):
+                current_contracts=value.get(key);base_contracts=base_change.get(key)
+                if isinstance(current_contracts,dict) and isinstance(base_contracts,dict):
+                    now_rows=current_contracts.get('artifacts',[]);old_rows=base_contracts.get('artifacts',[])
+                    if isinstance(now_rows,list) and isinstance(old_rows,list):
+                        old_by={item.get('id'):item for item in old_rows if isinstance(item,dict)}
+                        for index,item in enumerate(now_rows):
+                            if not isinstance(item,dict) or item.get('id') not in prior_by_id:continue
+                            effect=prior_by_id[item['id']];old=old_by.get(item['id'])
+                            need(item==effect['after'] and old==effect['before'],
+                                 'incremental_review_unavailable',
+                                 'Upper-contract artifact changed beyond a proven apply')
+                            now_rows[index]=old
+            current_scope=value.get('scope_review');base_scope=base_change.get('scope_review')
+            if isinstance(current_scope,dict) and isinstance(base_scope,dict):
+                current_contracts=current_scope.get('upper_contracts');base_contracts=base_scope.get('upper_contracts')
+                if isinstance(current_contracts,dict) and isinstance(base_contracts,dict):
+                    now_rows=current_contracts.get('artifacts',[]);old_rows=base_contracts.get('artifacts',[])
+                    if isinstance(now_rows,list) and isinstance(old_rows,list):
+                        old_by={item.get('id'):item for item in old_rows if isinstance(item,dict)}
+                        for index,item in enumerate(now_rows):
+                            if not isinstance(item,dict) or item.get('id') not in prior_by_id:continue
+                            effect=prior_by_id[item['id']];old=old_by.get(item['id'])
+                            need(item==effect['after'] and old==effect['before'],
+                                 'incremental_review_unavailable',
+                                 'Scope upper-contract artifact changed beyond a proven apply')
+                            now_rows[index]=old
+            # Nested material must otherwise be byte-for-byte the old linked-change view.
+            return value
+        base_link=base_material.get('linked_change');current_link=normalized.get('linked_change')
+        if base_link or current_link:
+            need(isinstance(base_link,dict) and isinstance(current_link,dict) and
+                 base_link.get('id')==current_link.get('id') and
+                 base_link.get('revision')==current_link.get('revision') and
+                 isinstance(base_link.get('material'),dict) and isinstance(current_link.get('material'),dict) and
+                 base_link.get('binding')==base_proposal.get('change_binding'),
+                 'incremental_review_unavailable',
+                 'An externalized or changed linked change requires a full consistency review')
+            current_material_normalized=normalize_change_material(current_link['material'],base_link['material'])
+            need(canonical(current_material_normalized)==canonical(base_link['material']),
+                 'incremental_review_unavailable',
+                 'Linked change changed beyond the exact prior artifact effects')
+            normalized['linked_change']=copy.deepcopy(base_link)
+        need(canonical(normalized)==canonical(base_material),
+             'incremental_review_unavailable',
+             'Decision material changed beyond bounded prior independent applies')
+        base_markers=set(base_material.get('required_coverage',[]))
+        current_markers=set(current_material.get('required_coverage',[]))
+        required=sorted(current_markers|{
+            'decision-apply-prior:'+item['decision'] for item in actions}|
+            {'decision-apply-artifact:'+item['target'] for item in actions if item['target'] is not None})
+        proof={'format':'decision-apply-incremental-proof.v1','subject':subject,
+            'base_review_receipt':base_receipt,'base_binding':base_review['binding'],
+            'base_run':base_review['run'],'base_run_observed_seq':base_seq,
+            'base_input_digest':base_review['input_digest'],
+            'base_material_digest':digest(base_material),'current_material_digest':digest(current_material),
+            'base_material':base_material,'current_material':current_material,
+            'applied_effects':actions,'base_required_coverage':old_required,
+            'current_required_coverage':sorted(current_markers),
+            'required_coverage':required}
+        context={'format':'decision-apply-incremental-review.v1','subject':subject,
+            'base_review':{'receipt':base_receipt,'binding':base_review['binding'],'run':base_review['run'],
+                'input_digest':base_review['input_digest'],'verdict':base_review['result']['verdict'],
+                'rationale':base_review['result'].get('rationale'),'covered':base_review['result'].get('covered',[]),
+                'required_coverage':old_required},
+            'base_material':base_material,'current_material':current_material,
+            'applied_effects':actions,
+            'review_instructions':'Review only the recorded effects of the earlier individually applied decisions on this unchanged proposal and human answer. Confirm the exact current linked change scope dispositions as shown. Do not treat a prior apply as changing this proposal, choice, source, or answer.',
+            'required_coverage':required,'proof':proof}
+        need(len(canonical(context))<=700000,'incremental_review_unavailable',
+             'Sequential apply proof exceeds the bounded supplemental-review size')
+        return context
+
     def decision_incremental_context(self,actor,subject,base_receipt,*,current_material=None):
         """Build a narrowly scoped delta review while retaining the full-material binding."""
         batch=self.s.one('SELECT * FROM decision_batches WHERE id=?',(subject,))
@@ -1130,6 +2042,11 @@ class Planning:
         current_binding=digest(current_material)
         base_review,base_run,base_context,base_material,old_required,base_seq=\
             self._base_incremental_review(actor,subject,base_receipt,is_batch)
+        if not is_batch:
+            apply_context=self._decision_apply_incremental_context(actor,subject,base_receipt,
+                current_material,(base_review,base_run,base_context,base_material,old_required,base_seq))
+            if apply_context is not None:
+                return apply_context
         addition,sources,links=self._incremental_added_requirement(project,base_material,
             current_material,is_batch,base_seq)
         need(canonical(base_material.get('invariants',[]))==canonical(current_material.get('invariants',[])),
@@ -1200,6 +2117,24 @@ class Planning:
         """Rebuild the delta context from current state before accepting its PASS."""
         binding=digest(current_material)
         receipt,run,context=self._receipt_prompt_context(review_receipt,subject,binding)
+        if context.get('format')!='decision-incremental-review.v1':
+            if context.get('format')!='decision-apply-incremental-review.v1':
+                return None
+            need(receipt.get('result',{}).get('verdict')=='pass',
+                 'review_failed','Sequential apply supplemental review did not pass')
+            proof=context.get('proof')
+            need(isinstance(proof,dict) and isinstance(proof.get('base_review_receipt'),str),
+                 'stale_evidence','Sequential apply review omits its carried full PASS')
+            expected=self.decision_incremental_context(actor,subject,proof['base_review_receipt'],
+                                                       current_material=current_material)
+            need(expected.get('format')=='decision-apply-incremental-review.v1' and
+                 canonical(context)==canonical(expected),'stale_evidence',
+                 'Sequential apply review no longer matches its exact controller proof')
+            missing=set(expected['required_coverage'])-set(receipt['result'].get('covered',[]))
+            need(not missing,'incomplete_review_coverage',
+                 'Sequential apply review omitted a required effect or current scope marker',
+                 {'missing':sorted(missing)})
+            return expected
         if context.get('format')!='decision-incremental-review.v1':
             return None
         need(receipt.get('result',{}).get('verdict')=='pass',
@@ -1811,12 +2746,12 @@ class Planning:
             need(len(seen)<=100,'decision_lineage_invalid','Decision supersedes chain exceeds its safety bound')
         return chain
 
-    def _validate_response_current(self,actor,row,body):
+    def _validate_response_current(self,actor,row,body,*,allow_reviewed_apply_drift=False):
         for ref in body.get('bindings',[]):
             current=self.k.artifact(actor,ref['id'])
             need(current['revision']==ref['revision'] and current['digest']==ref['digest'],
                  'stale_decision','A bound requirement changed')
-        if body.get('change'):
+        if body.get('change') and not allow_reviewed_apply_drift:
             need(body['change_binding']==self.change_binding(body['change']),
                  'stale_decision','Change proposal changed')
         if body.get('conflict'):
@@ -1871,6 +2806,44 @@ class Planning:
                  0<=start<end<=len(content) and content[start:end]==quoted,
                  'answer_evidence_invalid','The retained human quotation differs from its source range')
 
+    def _decision_apply_event_references(self,project,decision,receipt,body):
+        decision_event=self.s.one("SELECT id,seq,body FROM events WHERE project=? AND kind='decision_applied' "
+            "AND json_extract(body,'$.decision')=? AND json_extract(body,'$.receipt')=? ORDER BY seq DESC LIMIT 1",
+            (project,decision,receipt),True)
+        decision_details=parse_json(decision_event['body'])
+        need(not decision_details.get('batch'),'stale_evidence',
+             'Sequential individual apply cannot reference a batch event')
+        result={'decision_event':{'id':decision_event['id'],'seq':decision_event['seq'],
+                                  'body':decision_details},'change_event':None,'artifact_events':[]}
+        if not body.get('change'):
+            return result
+        change_events=self.s.all("SELECT id,seq,body FROM events WHERE project=? AND kind='change_applied' "
+            "AND json_extract(body,'$.decision')=? AND json_extract(body,'$.change')=? "
+            "AND json_extract(body,'$.receipt')=? AND seq<? ORDER BY seq DESC LIMIT 2",
+            (project,decision,body['change'],receipt,decision_event['seq']))
+        need(len(change_events)==1,'stale_evidence',
+             'Applied linked change has no unique journal reference')
+        change_event=change_events[0];change_details=parse_json(change_event['body'])
+        change_row=self.s.one('SELECT body FROM changes WHERE id=? AND project=?',
+                              (body['change'],project),True)
+        target_ids={delta['artifact'] for delta in parse_json(change_row['body']).get('deltas',[])}
+        need(set(change_details.get('changed',[]))==target_ids,
+             'stale_evidence','Applied change targets differ from the linked proposal')
+        artifact_events=[]
+        for artifact in sorted(target_ids):
+            current=self.k.artifact(Actor('system','owner'),artifact)
+            rows=self.s.all("SELECT id,seq,body FROM events WHERE project=? AND kind='artifact_revised' "
+                "AND json_extract(body,'$.id')=? AND json_extract(body,'$.revision')=? "
+                "AND json_extract(body,'$.digest')=? AND seq<? ORDER BY seq DESC LIMIT 2",
+                (project,artifact,current['revision'],current['digest'],change_event['seq']))
+            need(len(rows)==1,'stale_evidence','Applied target has no unique exact revision event',artifact)
+            artifact_events.append({'id':rows[0]['id'],'seq':rows[0]['seq'],
+                                    'body':parse_json(rows[0]['body'])})
+        result.update({'change_event':{'id':change_event['id'],'seq':change_event['seq'],
+                                       'body':change_details},
+                       'artifact_events':artifact_events})
+        return result
+
     def _human_quote_after_proposal(self,actor,row,decision,source,utterance):
         proposed=self.s.one("SELECT seq FROM events WHERE project=? AND kind='decision_proposed' "
                             "AND json_extract(body,'$.id')=? AND json_extract(body,'$.digest')=? ORDER BY seq DESC LIMIT 1",
@@ -1910,7 +2883,7 @@ class Planning:
             need(row['status']=='decision_received' and row['source'],'human_approval_required','A displayed proposal or agent approval is insufficient')
             src=self.s.one("SELECT trust FROM sources WHERE id=?",(row['source'],),True)
             need(src['trust']=='human','human_approval_required','No authenticated human response')
-            _,review_material=self.decision_review_material(decision)
+            _,review_material=self.decision_review_material(decision,allow_stale_linked_change=True)
             current_binding=digest(review_material)
             self.g.require_review(review_receipt,decision,current_binding,{'consistency'},latest=True)
             incremental=self.validate_decision_incremental_receipt(actor,decision,review_receipt,review_material)
@@ -1921,7 +2894,14 @@ class Planning:
                      'Consistency review did not cover every externally read decision material packet',
                      {'missing':sorted(required-set(receipt['result'].get('covered',[])))})
             body=parse_json(row['body'])
-            self._validate_response_current(actor,row,body)
+            allow_apply_drift=bool(incremental and
+                incremental.get('format')=='decision-apply-incremental-review.v1')
+            current_link=(review_material.get('linked_change') or {}).get('binding')
+            if body.get('change') and body.get('change_binding')!=current_link:
+                need(allow_apply_drift,'stale_decision',
+                     'The linked change changed after approval without a validated sequential-apply review')
+            self._validate_response_current(actor,row,body,
+                allow_reviewed_apply_drift=allow_apply_drift)
             effect=self._choice_effect(body,row['response'])
             actions=self._decision_effect_actions(body,effect)
             if actions['apply_policy']:
@@ -1932,7 +2912,8 @@ class Planning:
                 need(old['digest']==body['old_digest'],'stale_policy','Policy changed since proposal')
                 self.s.execute("UPDATE policies SET revision=revision+1,body=?,digest=? WHERE project=?",(canonical(body['body']).decode(),digest(body['body']),row['project']))
             if actions['apply_change']:
-                need(body['change_binding']==self.change_binding(body['change']),'stale_decision','Change was revised after approval')
+                need(allow_apply_drift or body['change_binding']==self.change_binding(body['change']),
+                     'stale_decision','Change was revised after approval')
                 self._apply_change(actor,body['change'],review_receipt,decision)
             elif actions['decline_change']:
                 self._decline_change(actor,row['project'],body['change'],decision)
@@ -1962,41 +2943,55 @@ class Planning:
             self.sec.event(row['project'],'decision_applied',actor.id,{'decision':decision,'receipt':review_receipt,
                 'selected_effect':effect})
             if incremental is not None:
-                archive_proof={**incremental['proof'],'base_material':incremental['base_material']}
-                self.sec.event(row['project'],'decision_incremental_review_applied',actor.id,
-                    {'decision':decision,'base_review_receipt':incremental['proof']['base_review_receipt'],
-                     'supplemental_review_receipt':review_receipt,
-                     'current_material_digest':incremental['current_material_digest'],
-                     'proof':archive_proof})
+                if incremental.get('format')=='decision-apply-incremental-review.v1':
+                    apply_events=self._decision_apply_event_references(row['project'],decision,
+                                                                       review_receipt,body)
+                    self.sec.event(row['project'],'decision_apply_incremental_review_applied',actor.id,
+                        {'decision':decision,'base_review_receipt':incremental['proof']['base_review_receipt'],
+                         'supplemental_review_receipt':review_receipt,
+                         'current_material_digest':incremental['proof']['current_material_digest'],
+                         'proof':incremental['proof'],'application_events':apply_events})
+                else:
+                    archive_proof={**incremental['proof'],'base_material':incremental['base_material']}
+                    self.sec.event(row['project'],'decision_incremental_review_applied',actor.id,
+                        {'decision':decision,'base_review_receipt':incremental['proof']['base_review_receipt'],
+                         'supplemental_review_receipt':review_receipt,
+                         'current_material_digest':incremental['current_material_digest'],
+                         'proof':archive_proof})
         result={'id':decision,'status':'applied','task_revalidations':task_revalidations}
         if incremental is not None:
             result.update({'review_mode':'incremental',
                 'base_review_receipt':incremental['proof']['base_review_receipt'],
                 'supplemental_review_receipt':review_receipt,
-                'current_material_digest':incremental['current_material_digest']})
+                'current_material_digest':incremental['proof']['current_material_digest']})
+            if incremental.get('format')=='decision-apply-incremental-review.v1':
+                result['applied_decisions']= [item['decision'] for item in incremental['applied_effects']]
+                result['incremental_review_format']=incremental['format']
         return result
 
     def apply_technical_change(self,actor,change,review_receipt):
         with self.s.transaction():
             row=self.s.one("SELECT * FROM changes WHERE id=?",(change,),True)
             actor.require('owner','agent',project=row['project'])
-            need(row['stage']=='reconciling','invalid_stage','Record a specification-preserving solution first')
-            body=parse_json(row['body'])
+            need(row['stage'] in {'local_repair','module_replan','system_replan','reconciling'},
+                 'invalid_stage','A product-level decision cannot be bypassed through technical apply')
             change_row,change_material=self.change_review_material(change)
             need(change_row['project']==row['project'],'cross_project','Change belongs elsewhere')
-            for delta in body.get('deltas',[]):
-                art=self.k.artifact(actor,delta['artifact'])
-                if self._is_display_metadata_repair(art,delta):
-                    self._validate_display_metadata_repair(actor,row,art,delta)
-                    continue
-                need(art['kind'] not in {'requirement','acceptance','outcome','decision'},'product_decision_required','Technical change cannot silently modify product semantics')
-            self.g.require_review(review_receipt,change,self.change_binding(change),{'consistency'},latest=True)
+            binding=digest(change_material)
+            self.g.require_review(review_receipt,change,binding,{'consistency'},latest=True)
             all_markers=set(change_material.get('required_coverage',[]))
             review=self.g.receipt(review_receipt)
             covered=set(review['result'].get('covered',[]))
             need(all_markers<=covered,'incomplete_review_coverage',
                  'Consistency review must cover every required change-material packet',
                  {'missing':sorted(all_markers-covered)})
+            self._validate_change_scope_result(change_material,review['result'],require_within=True)
+            body=parse_json(row['body'])
+            if self._is_user_editorial_repair(actor,row['project'],body):
+                need(all(value=='preserves_meaning' for value in
+                         self._validate_change_scope_result(change_material,review['result'],
+                                                            require_within=True)['effects'].values()),
+                     'product_decision_required','An editorial user repair needs a meaning-preserving review')
             repair_markers=['display-metadata-equivalence:'+d['artifact'] for d in body.get('deltas',[])
                             if self._is_display_metadata_repair(self.k.artifact(actor,d['artifact']),d)]
             if repair_markers:
@@ -2006,17 +3001,45 @@ class Planning:
                     need(marker in covered and any(isinstance(o,dict) and o.get('ref')==delta['artifact'] and
                          isinstance(o.get('detail'),str) and o['detail'].strip() for o in observations),
                          'repair_review_required','Consistency review must explicitly assess this title change and cite its artifact')
-            return self._apply_change(actor,change,review_receipt,None,allow_display_metadata_repair=True)
+            return self._apply_change(actor,change,review_receipt,None)
 
-    def _apply_change(self,actor,change,receipt,decision,*,allow_display_metadata_repair=False,skip_conflict_check=False):
+    def _apply_change(self,actor,change,receipt,decision,*,skip_conflict_check=False):
         row=self.s.one("SELECT * FROM changes WHERE id=?",(change,),True)
         body=parse_json(row['body']);deltas=body.get('deltas',[])
         need(deltas,'empty_change','No implementation delta was defined')
+        # Registration can leave a no-effect request open for a substantive
+        # follow-up, but no technical, human or batch apply path may turn that
+        # exact no-op into an artifact revision or an acknowledgement.
+        need(not self._change_has_no_effect(Actor('system','owner'),row['project'],body,deltas),
+             'change_has_no_effect',
+             'The proposed delta leaves accepted artifacts unchanged; the source request remains unresolved')
+        change_row,material=self.change_review_material(change)
+        review=self.g.receipt(receipt)
+        scope_result=self._validate_change_scope_result(material,review.get('result',{}),
+            allow_upper=decision is not None,require_within=decision is None)
+        if decision is not None:
+            direct_upper=(scope_result['scope']=='upper_scope_required' and
+                          scope_result['target_layer']=='awaiting_product_decision')
+            exhausted_system=self._has_current_system_no_solution_path(change,scope_result)
+            need(row['stage']=='awaiting_product_decision' and (direct_upper or exhausted_system),
+                 'human_approval_required','Upper-scope changes require a current human decision and resolved impact evidence',
+                 {'stage':row['stage'],'scope':scope_result['scope'],
+                  'layer':scope_result['layer'],'target_layer':scope_result['target_layer'],
+                  'direct_upper':direct_upper,'system_no_solution_path':exhausted_system})
+            need(not any(value=='unknown' for value in scope_result['effects'].values()) and
+                 not any(value=='unknown' for value in scope_result['consumers'].values()) and
+                 not scope_result['unknown_neighbors'] and
+                 not scope_result['unknown_interface_contracts'],
+                 'unknown_change_impact','Unresolved consumer or semantic impact prevents application')
+        roots=self._change_roots(body)
+        actual_impact=self.k.impact(Actor('system','owner'),row['project'],roots)
+        need(canonical(actual_impact)==canonical(body.get('impact')),
+             'stale_change_impact','Current graph impact differs; recalculate and review the change again')
+        for task in actual_impact.get('tasks',[]):
+            if self.s.one("SELECT id FROM tasks WHERE id=? AND status!='cancelled'",(task,)):
+                need(self.s.one("SELECT 1 FROM blocks WHERE task=? AND kind='change' AND ref=?",(task,change)),
+                     'stale_change_impact','A newly affected task is not stopped for this change',task)
         changed=self.validate_deltas(actor,row['project'],deltas)
-        for delta in deltas:
-            art=self.k.artifact(actor,delta['artifact'])
-            if allow_display_metadata_repair and self._is_display_metadata_repair(art,delta):
-                self._validate_display_metadata_repair(actor,row,art,delta)
         if not skip_conflict_check:
             for delta in deltas:
                 conflicts=self.k.explicit_conflicts(row['project'],delta['body'],exclude=changed)
@@ -2031,12 +3054,17 @@ class Planning:
             if delta.get('withdraw'):
                 need(body.get('compensation') or not self.s.one("SELECT id FROM deliveries WHERE project=? AND status='delivered'",(row['project'],)), 'compensation_required','Published changes need compensation or migration')
             self.k._revise(actor,art,delta['expected_revision'],delta['body'],'Change '+change,'withdrawn' if delta.get('withdraw') else 'accepted')
+        task_revalidations=[]
+        if decision is None:
+            task_revalidations=self._revalidate_unaffected_change_tasks(actor,change,material,scope_result,receipt)
         self.s.execute("UPDATE changes SET stage='ready_for_reimplementation',revision=revision+1 WHERE id=?",(change,))
         self.s.execute("DELETE FROM blocks WHERE kind='change' AND ref=?",(change,))
         self._close_notices(row['project'],change,actor.id,'change_applied')
         self._terminalize_change_decisions(row['project'],change,actor.id,'change_applied',exclude=(decision,) if decision else ())
-        self.sec.event(row['project'],'change_applied',actor.id,{'change':change,'receipt':receipt,'decision':decision,'changed':sorted(changed)})
-        return {'id':change,'stage':'ready_for_reimplementation','reassessment_required':True}
+        self.sec.event(row['project'],'change_applied',actor.id,{'change':change,'receipt':receipt,'decision':decision,
+            'changed':sorted(changed),'task_revalidations':task_revalidations})
+        return {'id':change,'stage':'ready_for_reimplementation','reassessment_required':True,
+                'task_revalidations':task_revalidations}
 
     def withdraw(self,actor,change,reason,compensation):
         row=self.s.one("SELECT * FROM changes WHERE id=?",(change,),True)

@@ -14,6 +14,7 @@ from daikibo.common import Fault
 from daikibo.governance import Governance
 from daikibo.workflow import Workflow
 from daikibo.unit4_enforcement import inspect_task_admission
+from conftest import route_change_to_product
 from test_delivery_git_and_recovery import profile
 from test_e3_selection_contract import _adopt
 from test_local_execution import (
@@ -377,7 +378,7 @@ def _prepare_mixed_owner_admission_case(full, tmp_path):
     }
 
 
-def _revise_root_interface_through_public_change(full, case):
+def _revise_root_interface_through_public_change(full, case, tmp_path):
     """Revise A-only contract material through the normal change workflow."""
     current = full.k.artifact(full.owner, case["root_interface"])
     source = full.s.one(
@@ -412,27 +413,55 @@ def _revise_root_interface_through_public_change(full, case):
             }],
         },
     )
-    feasibility = full.rt.review(
-        full.owner, change["id"], "feasibility", "fixture",
+    # Contract-field changes go through an upper decision because the
+    # controller cannot prove that its consumer census is exhaustive. The
+    # deterministic reviewer keeps the behavior-equivalence judgment scoped
+    # to this public test fixture and explicitly routes the change upward.
+    reviewer_script = tmp_path / "unit4_r_upper_scope_review.py"
+    reviewer_script.write_text(
+        "import json,sys\n"
+        "p=json.load(sys.stdin); c=p.get('context',{}); required=c.get('required_coverage',[])\n"
+        "dispositions=[]; observations=[]\n"
+        "for marker in required:\n"
+        " if marker.startswith('scope:'): resolution='upper_scope_required'\n"
+        " elif marker.startswith('target:'): resolution='awaiting_product_decision'\n"
+        " elif marker.startswith('effect:'):\n"
+        "  resolution='preserves_meaning'; observations.append({'ref':marker.split(':',1)[1],"
+        "'detail':'Fixture compared this exact interface wording and source; test-only judgment.'})\n"
+        " elif marker.startswith('carry:'): resolution='affected'\n"
+        " elif marker.startswith('consumer:'): resolution='addressed'\n"
+        " elif marker.startswith('unknown-neighbor:'): resolution='unresolved'\n"
+        " else: continue\n"
+        " dispositions.append({'id':marker,'resolution':resolution,'reason':'Test-only typed upper-scope review.'})\n"
+        "print(json.dumps({'verdict':'pass','rationale':'Deterministic protocol fixture only.',"
+        "'covered':required,'findings':[],'observations':observations or [{'ref':p.get('subject','review'),"
+        "'detail':'Fixture reviewed the exact supplied packet.'}],'dispositions':dispositions}))\n",
+        encoding="utf-8",
     )
-    full.p.attempt(
-        full.owner,
-        change["id"],
-        "local_repair",
-        {
-            "hypothesis": "Apply the reviewed root A contract clarification.",
-            "alternatives": ["Retain the previous root A contract."],
-            "evidence": [feasibility["receipt"]],
-            "outcome": "solution",
-            "remaining_unknown": "",
-        },
+    reviewer = "unit4-r-upper-scope-reviewer"
+    full.rt.adapters.register(
+        full.owner, reviewer, "fixture", sys.executable, [str(reviewer_script)],
     )
-    consistency = full.rt.review(
-        full.owner, change["id"], "consistency", "fixture",
+    assert route_change_to_product(full, change["id"], adapter=reviewer) == "awaiting_product_decision"
+    decision = full.p.propose_decision(full.owner, case["project"], {
+        "title": "Adopt the reviewed root A contract clarification",
+        "reason": "The updated root interface contract is approved at the upper layer.",
+        "options": ["approve", "keep_existing"], "recommendation": "approve",
+        "refs": [case["root_interface"]], "requirement_affecting": True,
+        "change": change["id"],
+    })
+    answer_text = "Approve the exact reviewed root A contract clarification"
+    answer = full.k.source(full.owner, case["project"], answer_text)
+    full.k.classify(full.owner, answer["id"], 0, answer["characters"],
+                    "reference", [], "Authenticated response to the reviewed decision")
+    partition = full.traceability.propose(
+        full.owner, case["project"], kind="document", scope={"source": answer["id"]},
     )
-    return full.p.apply_technical_change(
-        full.owner, change["id"], consistency["receipt"],
-    )
+    full.traceability.extract(full.owner, partition["id"])
+    full.p.respond(full.owner, decision["id"], decision["digest"], "approve",
+                   answer_text, source=answer["id"])
+    consistency = full.rt.review(full.owner, decision["id"], "consistency", reviewer)
+    return full.p.apply_decision(full.owner, decision["id"], consistency["receipt"])
 
 
 def test_task_admission_reads_active_root_a_and_local_b_owners(
@@ -507,8 +536,8 @@ def test_task_admission_ands_stale_root_a_with_current_local_b(
         "SELECT status,epoch,attempts,lease_owner,lease_until,candidate FROM tasks WHERE id=?",
         (case["task"],), True,
     )
-    applied = _revise_root_interface_through_public_change(full, case)
-    assert applied["reassessment_required"] is True
+    applied = _revise_root_interface_through_public_change(full, case, tmp_path)
+    assert applied["status"] == "applied"
     refreshed = _refresh_mixed_local_proposal(
         full, case, tmp_path, "local-mixed-after-root-stale-1",
     )

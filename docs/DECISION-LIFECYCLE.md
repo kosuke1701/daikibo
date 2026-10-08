@@ -1,6 +1,6 @@
 # Decision and change lifecycle
 
-This guide covers grouped decision adoption and narrow, specification-preserving display repairs. RPC examples use `daikibo call METHOD --json JSON`; IDs and adapter names are placeholders.
+This guide covers decision adoption, layered change review, and bounded supplemental review after an earlier individual decision is applied. RPC examples use `daikibo call METHOD --json JSON`; IDs and adapter names are placeholders.
 
 ## Bind each answer choice to its effect
 
@@ -70,33 +70,55 @@ Preview the option with `decision.review_subject` and `incremental_from` (or `de
 
 The base receipt must remain the latest fully covered consistency PASS for the original material. The supplemental review uses the current full-material binding, so a later full or supplemental FAIL for that material supersedes it. Apply rebuilds the append-only proof and rechecks both receipt families, all coverage and current source/artifact snapshots. For a batch, the original immutable packet body and digest remain unchanged; its applied result records the base receipt, supplemental receipt, current material digest and reconstruction proof. Historical export checks that proof's structure and the frozen artifact, source and trace-link snapshots. Exported receipt IDs are historical references: archive validation does not authenticate live receipt judgments and cannot authorize a later apply.
 
-## Apply a display-title repair without a second human answer
+## Review changes at the layer that can close them
 
-This route is limited to an accepted artifact whose canonical body changes only in `title`. Every other field must remain byte-for-byte equivalent after canonical JSON encoding; the delta must not withdraw the artifact. Title can carry product meaning, so this structural test only identifies a candidate repair. The original trusted user source and an independent latest consistency review still have to support semantic equivalence.
+`change.propose` records origin and evidence, but origin does not decide whether a change needs a user answer. A `user` origin must reference a human-trusted source; other origins remain provenance claims and need evidence for their proposed effects. A new change starts at `local_repair`. Submit an independent consistency review of its current `change.get`/`change.read` material. The controller-generated packet binds the exact before/after bodies, cited evidence, current affected graph, upper-contract paths and pins, known interface consumers, and bounded candidates for task review carry.
 
-Create the change from the existing user instruction and exact artifact revision:
+The reviewer must cover every typed disposition marker and return one disposition for each controller-created ID. The change-level scope is `within_scope`, `upper_scope_required`, or `unresolved`; a separate target names the current or an explicitly higher layer. Each delta has an effect disposition: `preserves_meaning`, `within_current_contract`, `changes_upper_contract`, or `unknown`. `preserves_meaning` must cite the exact artifact in an observation. `within_current_contract` is accepted only when the controller finds a bounded, asserted, correctly directed path to an accepted parent contract and binds its current pin. Unknown consumers and unsupported upper-contract evidence keep the change open for discovery or escalation. A reviewer cannot clear a declared unknown neighbor by assertion, and there is no in-place API to remove that declaration; after discovery, submit a replacement change with the resulting controller evidence.
+
+When the final delta is already known and can close within the current layer, one consistency review covers both layer scope and the proposed effect; no separate feasibility review is required. `change.apply` rechecks the current impact graph, artifact revisions, upper-contract pins, scope receipt, and latest verdict in its writer transaction. If the review identifies an upper layer, record a `change.attempt` with `outcome: "scope_exceeded"` and the same current consistency receipt; this routes directly to the reviewed layer without claiming that the current layer exhausted its search. The next layer sees its own current packet and obtains a fresh review because the layer and change binding changed. Product-level changes still require the existing human decision workflow. A later delta revision recomputes affected roots and tasks and invalidates earlier decision bindings.
+
+The same review can judge a source-backed spelling or statement correction. There is no field-name shortcut: even a title-only difference is just a candidate, and the trusted human source plus independent meaning-preservation judgment are still required. Ordinary requirement, acceptance, design, and implementation edits can close inside the layer only when their reviewed effect remains within an evidenced accepted parent contract. Interface contract-field changes currently route upward unless the review can establish meaning preservation; unknown external consumer completeness is not inferred from a list of registered consumers.
+
+Affected tasks are stopped while a substantive change is open. A task may retain its current validity only through a controller-recorded pre-change fence and an independent latest review that marks it unaffected. This can include bounded candidates recorded at registration or when a delta update recalculates impact; over-limit or missing proof stays on normal reassessment. The task must be planned but unstarted, have unchanged definition and accepted read pins, and have no other blocker, formal plan, lease, candidate, or execution history. The controller updates changed read pins and records task revalidation in the same transaction. Executed, formally planned, leased, previously blocked, or ambiguous tasks stay on normal reassessment. This is not a general old-receipt carry mechanism.
+
+An exact no-op is recorded with `no_effect: true` and an event, without creating an artifact revision, review job, or task fence. It does not answer or fulfill the source request, acknowledge a notice, or close the change; a substantive delta can still be submitted. If an open substantive proposal is revised to an exact no-op, only tasks covered by its original controller-recorded fence can be revalidated. The apply boundary recomputes the no-op condition so a redundant technical, human, or batch apply cannot manufacture a new revision.
+
+## Correct a source-backed spelling without a second human answer
+
+Create the change from the existing user instruction and exact artifact revision. The body edit may target a statement or other text field; the source and independent review must establish that the product meaning is unchanged:
 
 ```json
 {
   "project":"PRJ-...",
   "body":{
-    "title":"Clarify the requirement label",
+    "title":"Correct a requirement spelling",
     "origin":"user",
-    "reason":"Use the label requested in the source",
+    "reason":"Apply the exact source-backed spelling correction",
     "source":"SRC-...",
     "affected":["REQUIREMENT-..."],
     "evidence":["SRC-..."],
     "deltas":[{
       "artifact":"REQUIREMENT-...",
       "expected_revision":4,
-      "body":{"title":"Clearer label","statement":"UNCHANGED", "acceptance":["UNCHANGED"], "source_refs":["UNCHANGED"]}
+      "body":{"title":"UNCHANGED","statement":"Corrected spelling","acceptance":["UNCHANGED"], "source_refs":["UNCHANGED"]}
     }]
   }
 }
 ```
 
-Call `change.propose`, then obtain a feasibility review receipt with `job.submit` (`subject` is the change ID and `role` is `feasibility`). Record a bounded solution with `change.attempt`, citing the review receipt in `evidence` and setting `outcome` to `solution`. This moves the change to `reconciling`.
+Call `change.propose`, submit one consistency review for the change, then call `change.apply` with that latest receipt. The reviewer sees the complete before/after artifact, the exact source text when it fits inline (otherwise a digest-bound `source.read` reference), and the required `change-effect:ARTIFACT-ID` and `effect:ARTIFACT-ID` markers. A meaning-preserving result must cite the artifact in an observation. The apply boundary rechecks the source trust, current delta, full coverage, current impact, upper-contract pins, and latest verdict. A spelling or title difference by itself never grants semantic equivalence.
 
-Submit a consistency review for the change. Its canonical context includes the complete before/after artifact, exact source text when it fits inline (otherwise a digest-bound `source.read` reference), and a `display-metadata-equivalence:ARTIFACT-ID` coverage marker. The reviewer must cover the marker, cite the artifact in an observation, and determine from the source that the title does not alter product meaning. Then call `change.apply` with the current consistency receipt. The application rechecks the current artifact, source trust, exact delta, latest receipt and marker coverage. A title-only diff by itself never grants semantic equivalence.
+## Apply individually reviewed decisions in sequence
 
-Changes to statements, acceptance criteria, constraints, interfaces or other behavior remain on the normal product-decision path. A title change combined with a withdrawal is also rejected by the technical-repair route.
+Use `decision.batch_prepare` and one atomic batch review when several decisions can be adopted together. When decisions need separate individual applies, a later decision can avoid an unrelated full re-review only if the controller proves that the changes since its full PASS came from one to twenty earlier recorded individual applies. Each prior decision must be visible in the base packet and have one exact apply event. It may be a record-only decision, or one non-overlapping accepted change to a single artifact; other side effects and a change to the current decision's own target are not carried.
+
+Preview with `decision.review_subject` and the receipt for the original full review:
+
+```json
+{"decision":"DECISION-...","incremental_from":"BASE_RECEIPT"}
+```
+
+If the returned `incremental_review` has `available: true` and format `decision-apply-incremental-review.v1`, submit a normal consistency review with `proposal: {"incremental_from":"BASE_RECEIPT"}`. The packet keeps the full base and current materials and proves the intervening apply events. The supplemental reviewer checks how those exact prior outcomes affect this unchanged proposal, answer, source, policy, invariants, and linked change. It must cover each `decision-apply-prior:DECISION-ID` marker and each `decision-apply-artifact:ARTIFACT-ID` marker. Apply with the usual `decision.apply` call.
+
+The base must remain the latest fully covered consistency PASS for the original material, and the supplemental PASS must be latest for the current material. Apply reconstructs the bounded event history and exact material transition inside the transaction; a later FAIL, concurrent apply, changed proposal/answer/source, overlapping artifact, unrelated accepted artifact, unknown event, unsupported side effect, oversized or externalized proof, or more than twenty prior applies prevents this route and requires a full review. Run the preview again after each individual apply to create a fresh supplemental review for the next decision. Portable history records and structurally validates both snapshots, proof, and apply-event references; it does not authenticate archived receipt verdicts or authorize a future apply.

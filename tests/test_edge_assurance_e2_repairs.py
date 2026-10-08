@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from daikibo.common import Fault, digest
+from conftest import route_change_to_product
 
 
 def _artifact_ref(project, row):
@@ -81,6 +82,9 @@ def _revise_artifact(full, project, artifact, body):
         "source": source["id"], "affected": [artifact["id"]], "evidence": [source["id"]],
         "deltas": [{"artifact": artifact["id"], "expected_revision": 1, "body": body}],
     })
+    assert route_change_to_product(
+        full, change["id"], adapter="assurance-fixture"
+    ) == "awaiting_product_decision"
     decision = full.p.propose_decision(full.owner, project, {
         "title": "Repair revision", "reason": "Repair fixture", "options": ["approve", "keep_existing"],
         "recommendation": "approve", "refs": [artifact["id"]], "requirement_affecting": True,

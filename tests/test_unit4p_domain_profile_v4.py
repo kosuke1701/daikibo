@@ -22,6 +22,7 @@ from daikibo.assurance_denominators import collect_stage_context, derive_denomin
 from daikibo.assurance_criteria import build_relation_request, build_review_assurance, evaluate_criteria, _obligation_owner_refs
 from daikibo.assurance_node_reviews import build_node_requests, select_node_reviews
 from daikibo.common import Fault, canonical, digest
+from conftest import route_change_to_product
 from test_e3_selection_contract import _fixture, _profile_body, _adopt, _register_fixture_review, _source_ref, _review_refs
 from unit4p_domain_fixture import canonical_flow, aref, tref, accept, reviews_adopt, populate_realizes, git_commit, git_file_ref
 
@@ -207,6 +208,9 @@ def _change_artifact(c,f,artifact,body):
     change=c.p.change(c.owner,p,{'title':'Reviewed revision','origin':'user','reason':'update declared contract',
         'source':src,'affected':[artifact['id']],'evidence':[src],
         'deltas':[{'artifact':artifact['id'],'expected_revision':artifact['revision'],'body':body}]})
+    assert route_change_to_product(
+        c,change['id'],adapter='e3-assurance-fixture'
+    )=='awaiting_product_decision'
     decision=c.p.propose_decision(c.owner,p,{'title':'Approve revision','reason':'source grounded',
         'options':['approve','keep_existing'],'recommendation':'approve','refs':[artifact['id']],
         'requirement_affecting':True,'change':change['id']})
